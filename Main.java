@@ -1,10 +1,11 @@
-
 import spoon.Launcher;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
 import spoon.reflect.declaration.*;
 import spoon.reflect.reference.*;
 import spoon.reflect.visitor.filter.TypeFilter;
+import spoon.support.reflect.code.*;
+import spoon.support.reflect.declaration.*;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.*;
@@ -12,7 +13,26 @@ import com.fasterxml.jackson.databind.node.*;
 import java.io.File;
 import java.util.*;
 
-
+/**
+ * Two-pass static analyzer built on Spoon.
+ *
+ * PASS 1 — Full recursive AST serialization
+ *   Every CtElement in Spoon's tree is walked recursively and
+ *   serialized to JSON. No cherry-picking — every node type,
+ *   every child, every piece of metadata is captured.
+ *   Output → ast/<QualifiedName>.json  (one file per class)
+ *   Loaded → MongoDB  (db: harmony_codebase, collection: ast_nodes)
+ *
+ * PASS 2 — Dependency / call graph extraction
+ *   Walks the same model a second time to build typed nodes
+ *   and edges for Neo4j.
+ *   Output → dependency_graph.json
+ *   Loaded → Neo4j AuraDB
+ *
+ * Cross-link
+ *   Every :Method and :Class node in Neo4j carries astDocId
+ *   = the MongoDB _id of the class AST document.
+ */
 public class Main {
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -45,12 +65,27 @@ public class Main {
         public Map<String, Object> props = new LinkedHashMap<>();
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // GLOBAL STORES
+    // ─────────────────────────────────────────────────────────────────────────
+    // Make these static to be accessible from static methods
+    static final Map<String, MethodNode>  methods  = new LinkedHashMap<>();
+    static final Map<String, ClassNode>   classes  = new LinkedHashMap<>();
+    static final Map<String, PackageNode> packages = new LinkedHashMap<>();
+    static final List<GraphEdge>          edges    = new ArrayList<>();
+    static final ObjectMapper             mapper   = new ObjectMapper();
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
 
     static String methodId(CtMethod<?> m) {
         return m.getDeclaringType().getQualifiedName() + "#" + m.getSignature();
     }
 
-    static String classId(CtType<?> t) { return t.getQualifiedName(); }
+    static String classId(CtType<?> t) { 
+        return t.getQualifiedName(); 
+    }
 
     static void ensurePackage(String pkg) {
         packages.computeIfAbsent(pkg, k -> {
@@ -64,7 +99,9 @@ public class Main {
 
     static GraphEdge edge(String from, String to, String type) {
         GraphEdge e = new GraphEdge();
-        e.fromId = from; e.toId = to; e.type = type;
+        e.fromId = from; 
+        e.toId = to; 
+        e.type = type;
         return e;
     }
 
@@ -78,10 +115,31 @@ public class Main {
     }
 
     static String safe(Object o) {
-        try { return o == null ? null : o.toString(); }
-        catch (Exception e) { return null; }
+        try { 
+            return o == null ? null : o.toString(); 
+        }
+        catch (Exception e) { 
+            return null; 
+        }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // PASS 1 — FULL RECURSIVE AST SERIALIZATION
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Recursively serialize any Spoon CtElement into a JSON ObjectNode.
+     *
+     * For every node we capture:
+     *   - nodeType   : the concrete Spoon class name (e.g. CtIfImpl, CtMethodImpl)
+     *   - role       : this node's role in its parent (e.g. BODY, CONDITION, THEN)
+     *   - position   : file, line, column (when available)
+     *   - signature  : short string representation of the element
+     *   - metadata   : type-specific fields (modifiers, name, type ref, value, etc.)
+     *   - children   : recursive array of child CtElements
+     *
+     * Nothing is cherry-picked. If Spoon parsed it, it ends up in the JSON.
+     */
     static ObjectNode serializeElement(spoon.reflect.declaration.CtElement el,
                                        String role,
                                        int depth) {
@@ -139,6 +197,12 @@ public class Main {
         return node;
     }
 
+    /**
+     * Extract type-specific metadata fields for well-known CtElement subtypes.
+     * These are stored flat on the node alongside the recursive children,
+     * making common queries simpler (e.g. just read node.name instead of
+     * hunting through children for a NAME child).
+     */
     @SuppressWarnings("unchecked")
     static void extractMetadata(spoon.reflect.declaration.CtElement el,
                                  ObjectNode node) {
@@ -150,7 +214,10 @@ public class Main {
         // Typed elements (fields, variables, parameters, methods)
         if (el instanceof CtTypedElement) {
             try {
-                node.put("type", safe(((CtTypedElement<?>) el).getType()));
+                CtTypedElement<?> typed = (CtTypedElement<?>) el;
+                if (typed.getType() != null) {
+                    node.put("type", safe(typed.getType().getQualifiedName()));
+                }
             } catch (Exception ignored) {}
         }
 
@@ -170,26 +237,35 @@ public class Main {
         if (el instanceof CtMethod) {
             CtMethod<?> m = (CtMethod<?>) el;
             node.put("signature",    safe(m.getSignature()));
-            node.put("returnType",   safe(m.getType()));
+            if (m.getType() != null) {
+                node.put("returnType",   safe(m.getType().getQualifiedName()));
+            }
             node.put("isOverriding", m.isOverriding());
             ArrayNode params = node.putArray("paramTypes");
-            for (CtParameter<?> p : m.getParameters())
-                params.add(safe(p.getType()));
+            for (CtParameter<?> p : m.getParameters()) {
+                if (p.getType() != null) {
+                    params.add(safe(p.getType().getQualifiedName()));
+                }
+            }
             ArrayNode thrown = node.putArray("thrownTypes");
-            for (CtTypeReference<?> t : m.getThrownTypes())
-                thrown.add(safe(t));
+            for (CtTypeReference<?> t : m.getThrownTypes()) {
+                thrown.add(safe(t.getQualifiedName()));
+            }
             // annotations as flat list
             ArrayNode anns = node.putArray("annotations");
             for (CtAnnotation<?> a : m.getAnnotations())
-                anns.add(safe(a.getAnnotationType()));
+                anns.add(safe(a.getAnnotationType().getQualifiedName()));
         }
 
         // Constructor
         if (el instanceof CtConstructor) {
             CtConstructor<?> c = (CtConstructor<?>) el;
             ArrayNode params = node.putArray("paramTypes");
-            for (CtParameter<?> p : c.getParameters())
-                params.add(safe(p.getType()));
+            for (CtParameter<?> p : c.getParameters()) {
+                if (p.getType() != null) {
+                    params.add(safe(p.getType().getQualifiedName()));
+                }
+            }
         }
 
         // Field
@@ -201,7 +277,7 @@ public class Main {
             catch (Exception ignored) {}
             ArrayNode anns = node.putArray("annotations");
             for (CtAnnotation<?> a : f.getAnnotations())
-                anns.add(safe(a.getAnnotationType()));
+                anns.add(safe(a.getAnnotationType().getQualifiedName()));
         }
 
         // Class / Interface
@@ -214,18 +290,18 @@ public class Main {
             node.put("isEnum",        t instanceof CtEnum);
             ArrayNode anns = node.putArray("annotations");
             for (CtAnnotation<?> a : t.getAnnotations())
-                anns.add(safe(a.getAnnotationType()));
+                anns.add(safe(a.getAnnotationType().getQualifiedName()));
             // superclass / interfaces flat for quick lookup
             try {
                 if (t instanceof CtClass) {
                     CtTypeReference<?> sup = ((CtClass<?>) t).getSuperclass();
-                    if (sup != null) node.put("superClass", safe(sup));
+                    if (sup != null) node.put("superClass", safe(sup.getQualifiedName()));
                 }
             } catch (Exception ignored) {}
             ArrayNode ifaces = node.putArray("superInterfaces");
             try {
                 for (CtTypeReference<?> i : t.getSuperInterfaces())
-                    ifaces.add(safe(i));
+                    ifaces.add(safe(i.getQualifiedName()));
             } catch (Exception ignored) {}
         }
 
@@ -234,7 +310,7 @@ public class Main {
             CtInvocation<?> inv = (CtInvocation<?>) el;
             node.put("methodName",  safe(inv.getExecutable().getSimpleName()));
             node.put("targetClass", inv.getExecutable().getDeclaringType() != null
-                                     ? safe(inv.getExecutable().getDeclaringType()) : null);
+                                     ? safe(inv.getExecutable().getDeclaringType().getQualifiedName()) : null);
         }
 
         // If statement
@@ -267,7 +343,9 @@ public class Main {
             CtTry s = (CtTry) el;
             ArrayNode catchTypes = node.putArray("catchTypes");
             for (CtCatch cb : s.getCatchers()) {
-                try { catchTypes.add(safe(cb.getParameter().getType())); }
+                try { 
+                    catchTypes.add(safe(cb.getParameter().getType().getQualifiedName())); 
+                }
                 catch (Exception ignored) {}
             }
             node.put("hasFinally", s.getFinalizer() != null);
@@ -322,7 +400,7 @@ public class Main {
 
         // Type reference
         if (el instanceof CtTypeReference) {
-            node.put("qualifiedName", safe(el));
+            node.put("qualifiedName", safe(((CtTypeReference<?>) el).getQualifiedName()));
         }
 
         // Lambda
@@ -337,8 +415,9 @@ public class Main {
 
         // New object
         if (el instanceof CtConstructorCall) {
+            CtConstructorCall<?> cc = (CtConstructorCall<?>) el;
             node.put("instantiatedType",
-                     safe(((CtConstructorCall<?>) el).getType()));
+                     safe(cc.getType() != null ? cc.getType().getQualifiedName() : null));
         }
 
         // Array access
@@ -369,6 +448,9 @@ public class Main {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // PASS 2 — DEPENDENCY / CALL GRAPH EXTRACTION  (Neo4j)
+    // ─────────────────────────────────────────────────────────────────────────
 
     static void extractCallGraph(CtModel model) {
 
@@ -432,10 +514,22 @@ public class Main {
                 mn.lineNumber    = method.getPosition().isValidPosition()
                                     ? method.getPosition().getLine() : -1;
                 mn.astDocId      = cqn;
-                try   { mn.returnType = method.getType().getQualifiedName(); }
+                try   { 
+                    if (method.getType() != null) {
+                        mn.returnType = method.getType().getQualifiedName(); 
+                    } else {
+                        mn.returnType = "void";
+                    }
+                }
                 catch (Exception e) { mn.returnType = "unknown"; }
                 for (CtParameter<?> p : method.getParameters()) {
-                    try   { mn.paramTypes.add(p.getType().getQualifiedName()); }
+                    try   { 
+                        if (p.getType() != null) {
+                            mn.paramTypes.add(p.getType().getQualifiedName()); 
+                        } else {
+                            mn.paramTypes.add("unknown");
+                        }
+                    }
                     catch (Exception e) { mn.paramTypes.add("unknown"); }
                 }
                 methods.put(mId, mn);

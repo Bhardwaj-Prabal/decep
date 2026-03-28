@@ -3,6 +3,7 @@ import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
 import spoon.reflect.declaration.*;
 import spoon.reflect.reference.*;
+import spoon.reflect.visitor.CtScanner;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -21,6 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * - Method dependencies (call graph)
  * - Mock candidates (fields that need mocking)
  * - Control flow structure (conditions, loops, returns)
+ * - Complete external calls with full signatures
  * 
  * JaCoCo already provides:
  * - Cyclomatic complexity
@@ -36,6 +38,7 @@ public class MainOptimized {
     // ─────────────────────────────────────────────────────────────────────────
     
     private static final int BATCH_PROGRESS = 500;  // Progress report every 500 classes
+    private static final int MAX_BODY_LENGTH = 50000;  // Only truncate if body exceeds this
     
     // ─────────────────────────────────────────────────────────────────────────
     // MODELS
@@ -65,10 +68,10 @@ public class MainOptimized {
         public List<String> nullChecks;     // All null check expressions
         public List<String> instanceChecks; // All instanceof checks
         
-        // Dependencies (for test generation)
+        // Dependencies (for test generation) - FULL signatures, never truncated
         public List<String> mockCandidates = new ArrayList<>();  // Fields to mock
         public List<String> siblingCalls = new ArrayList<>();    // Calls to other methods in same class
-        public List<String> externalCalls = new ArrayList<>();   // Calls to external services
+        public List<String> externalCalls = new ArrayList<>();   // Calls to external services (FULL signatures)
         
         // Cross-links
         public String astDocId;
@@ -184,7 +187,7 @@ public class MainOptimized {
         List<String> conditions = new ArrayList<>();
         if (method.getBody() == null) return conditions;
         
-        method.getBody().accept(new spoon.reflect.visitor.CtScanner() {
+        method.getBody().accept(new CtScanner() {
             @Override
             public void visitCtIf(CtIf ifElement) {
                 String cond = safe(ifElement.getCondition());
@@ -241,7 +244,7 @@ public class MainOptimized {
         List<String> returns = new ArrayList<>();
         if (method.getBody() == null) return returns;
         
-        method.getBody().accept(new spoon.reflect.visitor.CtScanner() {
+        method.getBody().accept(new CtScanner() {
             @Override
             public <T> void visitCtReturn(CtReturn<T> returnStmt) {
                 String expr = safe(returnStmt.getReturnedExpression());
@@ -264,7 +267,7 @@ public class MainOptimized {
         List<String> nullChecks = new ArrayList<>();
         if (method.getBody() == null) return nullChecks;
         
-        method.getBody().accept(new spoon.reflect.visitor.CtScanner() {
+        method.getBody().accept(new CtScanner() {
             @Override
             public <T> void visitCtBinaryOperator(CtBinaryOperator<T> op) {
                 String kind = safe(op.getKind());
@@ -289,7 +292,7 @@ public class MainOptimized {
         List<String> instanceChecks = new ArrayList<>();
         if (method.getBody() == null) return instanceChecks;
         
-        method.getBody().accept(new spoon.reflect.visitor.CtScanner() {
+        method.getBody().accept(new CtScanner() {
             @Override
             public <T> void visitCtBinaryOperator(CtBinaryOperator<T> op) {
                 String kind = safe(op.getKind());
@@ -319,6 +322,41 @@ public class MainOptimized {
             }
         }
         return candidates;
+    }
+    
+    /**
+     * Get full method signature including parameter types and return type
+     */
+    static String getFullMethodSignature(CtExecutableReference<?> exec) {
+        StringBuilder fullSig = new StringBuilder();
+        
+        // Class name
+        if (exec.getDeclaringType() != null) {
+            fullSig.append(exec.getDeclaringType().getQualifiedName());
+        } else {
+            fullSig.append("UnknownClass");
+        }
+        fullSig.append(".");
+        
+        // Method name
+        fullSig.append(exec.getSimpleName());
+        fullSig.append("(");
+        
+        // Parameter types
+        List<CtTypeReference<?>> paramTypes = exec.getParameters();
+        for (int i = 0; i < paramTypes.size(); i++) {
+            if (i > 0) fullSig.append(", ");
+            fullSig.append(paramTypes.get(i) != null ? 
+                paramTypes.get(i).getQualifiedName() : "unknown");
+        }
+        fullSig.append(")");
+        
+        // Return type
+        if (exec.getType() != null) {
+            fullSig.append(":").append(exec.getType().getQualifiedName());
+        }
+        
+        return fullSig.toString();
     }
     
     // ─────────────────────────────────────────────────────────────────────────
@@ -418,6 +456,12 @@ public class MainOptimized {
             paramNames.add(p.getSimpleName());
         }
         
+        // Thrown exceptions
+        ArrayNode thrown = node.putArray("thrownTypes");
+        for (CtTypeReference<?> t : method.getThrownTypes()) {
+            thrown.add(t.getQualifiedName());
+        }
+        
         // Modifiers
         ObjectNode modifiers = node.putObject("modifiers");
         modifiers.put("public", method.isPublic());
@@ -436,10 +480,14 @@ public class MainOptimized {
         // ─── CODE SNIPPETS (What LLM needs for test generation) ───
         
         if (method.getBody() != null) {
-            // Full method body
+            // Full method body - only truncate if ENORMOUS
             String bodyText = method.getBody().toString();
-            node.put("body", bodyText.length() > 10000 ? 
-                    bodyText.substring(0, 10000) + "\n// ... truncated ..." : bodyText);
+            if (bodyText.length() > MAX_BODY_LENGTH) {
+                node.put("body", bodyText.substring(0, MAX_BODY_LENGTH) + 
+                        "\n// ... body truncated (exceeds " + MAX_BODY_LENGTH + " chars) ...");
+            } else {
+                node.put("body", bodyText);
+            }
             
             // Conditions (for path analysis)
             ArrayNode conditions = node.putArray("conditions");
@@ -458,7 +506,8 @@ public class MainOptimized {
             extractInstanceChecks(method).forEach(instanceChecks::add);
         }
         
-        // Dependency info (to be filled from graph)
+        // ─── DEPENDENCIES (NEVER TRUNCATE!) ───
+        // These will be filled later in extractCallGraph
         node.putArray("mockCandidates");
         node.putArray("siblingCalls");
         node.putArray("externalCalls");
@@ -467,7 +516,7 @@ public class MainOptimized {
     }
     
     // ─────────────────────────────────────────────────────────────────────────
-    // DEPENDENCY GRAPH EXTRACTION
+    // DEPENDENCY GRAPH EXTRACTION (with FULL external call signatures)
     // ─────────────────────────────────────────────────────────────────────────
     
     static void extractCallGraph(CtModel model) {
@@ -606,7 +655,7 @@ public class MainOptimized {
                 methods.put(mId, mn);
                 edges.add(edge(cqn, mId, "HAS_METHOD"));
                 
-                // Extract calls
+                // Extract calls with FULL signatures
                 Set<String> siblingSet = new HashSet<>();
                 Set<String> externalSet = new HashSet<>();
                 
@@ -615,24 +664,29 @@ public class MainOptimized {
                             new TypeFilter<>(CtInvocation.class))) {
                         try {
                             String targetClass = "UnresolvedType";
-                            String methodName = inv.getExecutable().getSimpleName();
+                            CtExecutableReference<?> exec = inv.getExecutable();
                             
-                            if (inv.getExecutable().getDeclaringType() != null) {
-                                targetClass = inv.getExecutable()
-                                        .getDeclaringType().getQualifiedName();
+                            if (exec.getDeclaringType() != null) {
+                                targetClass = exec.getDeclaringType().getQualifiedName();
                             }
                             
-                            String targetId = targetClass + "#" + methodName;
+                            String methodName = exec.getSimpleName();
                             boolean ext = isExternalClass(targetClass);
+                            
+                            // Get FULL signature with parameters and return type
+                            String fullSignature = getFullMethodSignature(exec);
                             
                             // Check if it's a sibling call (same class)
                             if (targetClass.equals(cqn)) {
-                                siblingSet.add(methodName);
+                                siblingSet.add(methodName + "()");
                             }
                             
                             if (ext) {
-                                externalSet.add(targetClass + "." + methodName);
+                                // Store FULL signature for external calls
+                                externalSet.add(fullSignature);
                             }
+                            
+                            String targetId = targetClass + "#" + methodName;
                             
                             if (ext && !methods.containsKey(targetId)) {
                                 MethodNode em = new MethodNode();
@@ -692,7 +746,8 @@ public class MainOptimized {
             if (f.isDirectory() && !f.getName().startsWith(".") && 
                 !f.getName().equals("ast") && !f.getName().equals("build") &&
                 !f.getName().equals("target") && !f.getName().equals("lib") &&
-                !f.getName().equals("Bundles") && !f.getName().equals("Scanned")) {
+                !f.getName().equals("Bundles") && !f.getName().equals("Scanned") &&
+                !f.getName().equals("deploy")) {
                 if (containsJava(f)) {
                     srcFolders.add(f.getAbsolutePath());
                     System.out.println("  📁 Source folder: " + f.getName());
@@ -793,6 +848,7 @@ public class MainOptimized {
             map.put("conditions", mn.conditions);
             map.put("returnPoints", mn.returnPoints);
             map.put("nullChecks", mn.nullChecks);
+            map.put("instanceChecks", mn.instanceChecks);
             methodList.add(map);
         }
         
@@ -813,7 +869,7 @@ public class MainOptimized {
         mapper.writerWithDefaultPrettyPrinter()
               .writeValue(new File(graphJson), rootNode);
         
-        // ── Write method_index.json ─────────────────────────────────────────────
+        // ── Write method_index.json (with FULL signatures) ───────────────────────
         System.out.println("📇 Writing method index...");
         
         ObjectNode methodIndex = mapper.createObjectNode();
@@ -830,12 +886,19 @@ public class MainOptimized {
             entry.put("paramNames", mapper.valueToTree(mn.paramNames));
             entry.put("mockCandidates", mapper.valueToTree(mn.mockCandidates));
             entry.put("siblingCalls", mapper.valueToTree(mn.siblingCalls));
+            
+            // FULL external calls with signatures (NEVER truncated)
             entry.put("externalCalls", mapper.valueToTree(mn.externalCalls));
             
             // Code snippets for quick LLM access
             if (mn.methodBody != null) {
-                entry.put("body", mn.methodBody.length() > 5000 ? 
-                        mn.methodBody.substring(0, 5000) + "..." : mn.methodBody);
+                // Only truncate if ENORMOUS (prevents OOM but keeps useful context)
+                String body = mn.methodBody;
+                if (body.length() > MAX_BODY_LENGTH) {
+                    body = body.substring(0, MAX_BODY_LENGTH) + 
+                           "\n// ... body truncated (exceeds " + MAX_BODY_LENGTH + " chars) ...";
+                }
+                entry.put("body", body);
             }
             entry.put("conditions", mapper.valueToTree(mn.conditions));
             entry.put("returnPoints", mapper.valueToTree(mn.returnPoints));
@@ -862,10 +925,15 @@ public class MainOptimized {
         System.out.println("║   - dependency_graph.json (Neo4j)                        ║");
         System.out.println("║   - method_index.json (LLM lookup)                       ║");
         System.out.println("╠══════════════════════════════════════════════════════════╣");
+        System.out.println("║ External calls now have FULL signatures:                 ║");
+        System.out.println("║   Example: java.sql.Connection.commit():void             ║");
+        System.out.println("║            java.lang.reflect.Method.invoke():Object      ║");
+        System.out.println("╠══════════════════════════════════════════════════════════╣");
         System.out.println("║ Next steps:                                              ║");
         System.out.println("║   1. Parse JaCoCo XML to get uncovered methods           ║");
         System.out.println("║   2. Look up method in method_index.json                 ║");
         System.out.println("║   3. Send to LLM: code + dependencies + mock candidates  ║");
+        System.out.println("║   4. Generate targeted tests with precise mocks         ║");
         System.out.println("╚══════════════════════════════════════════════════════════╝");
     }
     

@@ -398,32 +398,28 @@ public class Neo4jStorage implements AutoCloseable {
      * Without batching: 8,000 round-trips.
      */
     private void runBatched(String label, String cypher,
-                            List<Map<String, Object>> rows) {
-        if (rows.isEmpty()) return;
+                        List<Map<String, Object>> rows) {
+    if (rows.isEmpty()) return;
 
-        int total     = rows.size();
-        int processed = 0;
-        int batches   = (int) Math.ceil((double) total / BATCH_SIZE);
+    int total   = rows.size();
+    int batches = (int) Math.ceil((double) total / BATCH_SIZE);
+    System.out.printf("  %-30s %,d items in %d batches%n",
+                      label, total, batches);
 
-        System.out.printf("  %-30s %,d items in %d batches%n",
-                          label, total, batches);
+    try (Session session = driver.session()) {
+        for (int i = 0; i < total; i += BATCH_SIZE) {
+            List<Map<String, Object>> chunk =
+                rows.subList(i, Math.min(i + BATCH_SIZE, total));
 
-        try (Session session = driver.session(sessionConfig())) {
-            for (int i = 0; i < total; i += BATCH_SIZE) {
-                List<Map<String, Object>> chunk =
-                    rows.subList(i, Math.min(i + BATCH_SIZE, total));
-
-                // writeTransaction auto-retries on transient errors
-                session.writeTransaction(tx -> {
-                    tx.run(cypher, Map.of("rows", chunk)).consume();
-                    return null;
-                });
-
-                processed += chunk.size();
+            // 6.x: use explicit transaction
+            try (Transaction tx = session.beginTransaction()) {
+                tx.run(cypher, Map.of("rows", chunk));
+                tx.commit();
             }
         }
-        System.out.printf("    Done: %,d%n", processed);
     }
+    System.out.printf("    Done: %,d%n", total);
+}
 
     // ─────────────────────────────────────────────────────────────────────────
     // VERIFY
@@ -455,59 +451,64 @@ public class Neo4jStorage implements AutoCloseable {
     // ─────────────────────────────────────────────────────────────────────────
 
     public List<Map<String, Object>> getCallers(String methodId) {
-        try (Session s = driver.session(sessionConfig())) {
-            return s.run("""
-                MATCH (caller:Method)-[:CALLS]->(m:Method {id: $id})
-                RETURN caller.id         AS id,
-                       caller.simpleName AS name,
-                       caller.className  AS className
-                LIMIT 20
-                """, Map.of("id", methodId))
-                .list(r -> r.asMap());
-        }
+    try (Session s = driver.session();
+         Transaction tx = s.beginTransaction()) {
+        return tx.run("""
+            MATCH (caller:Method)-[:CALLS]->(m:Method {id: $id})
+            RETURN caller.id AS id,
+                   caller.simpleName AS name,
+                   caller.className  AS className
+            LIMIT 20
+            """, Map.of("id", methodId))
+            .list(r -> r.asMap());
     }
+}
 
-    public List<Map<String, Object>> getCallees(String methodId) {
-        try (Session s = driver.session(sessionConfig())) {
-            return s.run("""
-                MATCH (m:Method {id: $id})-[:CALLS]->(callee:Method)
-                RETURN callee.id         AS id,
-                       callee.simpleName AS name,
-                       callee.className  AS className
-                LIMIT 20
-                """, Map.of("id", methodId))
-                .list(r -> r.asMap());
-        }
+public List<Map<String, Object>> getCallees(String methodId) {
+    try (Session s = driver.session();
+         Transaction tx = s.beginTransaction()) {
+        return tx.run("""
+            MATCH (m:Method {id: $id})-[:CALLS]->(callee:Method)
+            RETURN callee.id AS id,
+                   callee.simpleName AS name,
+                   callee.className  AS className
+            LIMIT 20
+            """, Map.of("id", methodId))
+            .list(r -> r.asMap());
     }
+}
 
-    public int getCallerCount(String methodId) {
-        try (Session s = driver.session(sessionConfig())) {
-            return s.run("""
-                MATCH ()-[:CALLS]->(m:Method {id: $id})
-                RETURN count(*) AS n
-                """, Map.of("id", methodId))
-                .single().get("n").asInt();
-        }
+public int getCallerCount(String methodId) {
+    try (Session s = driver.session();
+         Transaction tx = s.beginTransaction()) {
+        return tx.run("""
+            MATCH ()-[:CALLS]->(m:Method {id: $id})
+            RETURN count(*) AS n
+            """, Map.of("id", methodId))
+            .single().get("n").asInt();
     }
+}
 
-    public List<Map<String, Object>> getDeadMethods() {
-        try (Session s = driver.session(sessionConfig())) {
-            return s.run("""
-                MATCH (m:Method)
-                WHERE NOT ()-[:CALLS]->(m)
-                  AND NOT m.isAbstract
-                  AND NOT m.simpleName IN
-                      ['main','init','destroy','equals','hashCode',
-                       'toString','compareTo','doGet','doPost','run']
-                RETURN m.id         AS id,
-                       m.className  AS className,
-                       m.simpleName AS method,
-                       m.lineNumber AS line
-                ORDER BY className, method
-                """)
-                .list(r -> r.asMap());
-        }
+public List<Map<String, Object>> getDeadMethods() {
+    try (Session s = driver.session();
+         Transaction tx = s.beginTransaction()) {
+        return tx.run("""
+            MATCH (m:Method)
+            WHERE NOT ()-[:CALLS]->(m)
+              AND NOT m.isAbstract
+              AND NOT m.simpleName IN
+                  ['main','init','destroy','equals',
+                   'hashCode','toString','compareTo',
+                   'doGet','doPost','run']
+            RETURN m.id         AS id,
+                   m.className  AS className,
+                   m.simpleName AS method,
+                   m.lineNumber AS line
+            ORDER BY className, method
+            """)
+            .list(r -> r.asMap());
     }
+}
 
     // ─────────────────────────────────────────────────────────────────────────
     // UTILITIES

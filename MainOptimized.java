@@ -12,68 +12,65 @@ import com.fasterxml.jackson.databind.node.*;
 import java.io.File;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 
 /**
  * OPTIMIZED Coverage-Analysis Extractor
  * 
- * Performance optimizations:
- * 1. No reflection fallback (major speedup)
- * 2. Reduced depth limit from 35 to 15
- * 3. Skip inner/anonymous classes early
- * 4. Parallel processing for AST serialization
- * 5. Minimal metadata extraction (only what LLM needs)
- * 6. Direct MongoDB batch inserts (no intermediate files)
+ * Focuses ONLY on what JaCoCo doesn't provide:
+ * - Full method code (AST as JSON)
+ * - Method dependencies (call graph)
+ * - Mock candidates (fields that need mocking)
+ * - Control flow structure (conditions, loops, returns)
  * 
- * Expected runtime: 20-40 minutes (down from 6+ hours)
+ * JaCoCo already provides:
+ * - Cyclomatic complexity
+ * - Line/branch coverage
+ * - Method coverage
+ * 
+ * Expected runtime: 15-30 minutes
  */
-public class OptimizedMain {
+public class MainOptimized {
 
     // ─────────────────────────────────────────────────────────────────────────
     // CONFIGURATION
     // ─────────────────────────────────────────────────────────────────────────
     
-    private static final boolean INCLUDE_POSITIONS = true;      // Keep for line mapping
-    private static final boolean INCLUDE_SIGNATURES = true;     // Keep for method lookup
-    private static final boolean INCLUDE_METRICS = true;        // Keep for complexity
-    private static final boolean USE_REFLECTION = false;        // DISABLED (major speedup)
-    private static final int MAX_DEPTH = 15;                    // Reduced from 35
-    private static final int BATCH_SIZE = 100;                  // For MongoDB batch insert
-    private static final boolean WRITE_FILES = false;           // Set to false if using MongoDB
-    private static final boolean USE_MONGODB = true;            // Direct MongoDB insert
+    private static final int BATCH_PROGRESS = 500;  // Progress report every 500 classes
     
     // ─────────────────────────────────────────────────────────────────────────
-    // MODELS (Simplified for LLM)
+    // MODELS
     // ─────────────────────────────────────────────────────────────────────────
     
     static class MethodNode {
         public String id, simpleName, className, packageName;
         public String returnType;
         public List<String> paramTypes = new ArrayList<>();
+        public List<String> paramNames = new ArrayList<>();
         public List<String> thrownTypes = new ArrayList<>();
         public List<String> annotations = new ArrayList<>();
+        
+        // Modifiers (from Spoon)
         public boolean isPublic, isPrivate, isProtected;
-        public boolean isStatic, isAbstract;
+        public boolean isStatic, isAbstract, isFinal;
+        public boolean isConstructor;
+        public boolean isExternal = false;
+        
+        // Location (for JaCoCo line mapping)
         public int lineStart = -1, lineEnd = -1;
         
-        // Coverage metrics
-        public int cyclomaticComplexity = 1;
-        public int branchCount = 0;
-        public int loopCount = 0;
-        public int throwCount = 0;
-        public int catchCount = 0;
-        public boolean hasNullCheck = false;
-        public boolean hasInstanceofCheck = false;
-        
-        // Code snippets (what LLM really needs)
+        // Code snippets (what LLM needs)
         public String methodBody;           // Full method body as text
-        public List<String> conditions;     // All conditions in method
-        public List<String> returnPoints;   // All return statements
+        public List<String> conditions;     // All condition expressions
+        public List<String> returnPoints;   // All return expressions
+        public List<String> nullChecks;     // All null check expressions
+        public List<String> instanceChecks; // All instanceof checks
         
-        // Dependencies (will be filled from Neo4j later)
-        public List<String> mockCandidates = new ArrayList<>();
-        public List<String> siblingCalls = new ArrayList<>();
+        // Dependencies (for test generation)
+        public List<String> mockCandidates = new ArrayList<>();  // Fields to mock
+        public List<String> siblingCalls = new ArrayList<>();    // Calls to other methods in same class
+        public List<String> externalCalls = new ArrayList<>();   // Calls to external services
         
+        // Cross-links
         public String astDocId;
         public String neo4jId;
     }
@@ -83,9 +80,13 @@ public class OptimizedMain {
         public boolean isInterface, isAbstract, isEnum;
         public List<String> fieldNames = new ArrayList<>();
         public List<String> fieldTypes = new ArrayList<>();
+        public List<String> fieldAnnotations = new ArrayList<>();
         public String superClass;
         public List<String> superInterfaces = new ArrayList<>();
+        public List<String> annotations = new ArrayList<>();
         public String astDocId;
+        public String sourceFile;
+        public int lineStart, lineEnd;
     }
     
     static class PackageNode {
@@ -108,15 +109,7 @@ public class OptimizedMain {
     static final Map<String, Set<String>> callers = new LinkedHashMap<>();
     
     static final ObjectMapper mapper = new ObjectMapper()
-        .configure(SerializationFeature.INDENT_OUTPUT, false)  // No pretty print during serialization
-        .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
-    
-    // ─────────────────────────────────────────────────────────────────────────
-    // MONGODB CONNECTION (if using)
-    // ─────────────────────────────────────────────────────────────────────────
-    
-    static com.mongodb.client.MongoClient mongoClient;
-    static com.mongodb.client.MongoCollection<org.bson.Document> astCollection;
+        .configure(SerializationFeature.INDENT_OUTPUT, false);
     
     // ─────────────────────────────────────────────────────────────────────────
     // HELPERS
@@ -148,11 +141,22 @@ public class OptimizedMain {
     }
     
     static boolean isExternalClass(String fqn) {
-        if (fqn == null || fqn.equals("UnresolvedType")) return true;
+        if (fqn == null || fqn.equals("UnresolvedType") || fqn.isEmpty()) return true;
         return fqn.startsWith("java.") || fqn.startsWith("javax.") ||
                fqn.startsWith("sun.") || fqn.startsWith("com.sun.") ||
                fqn.startsWith("org.springframework.") || fqn.startsWith("org.hibernate.") ||
-               fqn.startsWith("org.apache.") || fqn.startsWith("org.slf4j.");
+               fqn.startsWith("org.apache.") || fqn.startsWith("org.slf4j.") ||
+               fqn.startsWith("org.junit.") || fqn.startsWith("org.mockito.");
+    }
+    
+    static boolean isMockCandidate(String fieldType, String fieldName) {
+        if (fieldType == null) return false;
+        String ft = fieldType.toLowerCase();
+        return ft.contains("service") || ft.contains("repository") ||
+               ft.contains("dao") || ft.contains("client") ||
+               ft.contains("manager") || ft.contains("handler") ||
+               ft.contains("provider") || ft.contains("factory") ||
+               ft.contains("template") || fieldName.toLowerCase().contains("mock");
     }
     
     static String safe(Object o) {
@@ -166,180 +170,12 @@ public class OptimizedMain {
     static boolean isAnonymous(CtType<?> t) {
         return t.getSimpleName().contains("$") || 
                t.getQualifiedName().contains("$") ||
-               t.isAnonymous() ||
-               t.isLocalType();
+               t.getSimpleName().isEmpty();
     }
     
     // ─────────────────────────────────────────────────────────────────────────
-    // OPTIMIZED SERIALIZER - Only what LLM needs
+    // CODE EXTRACTION (What LLM needs)
     // ─────────────────────────────────────────────────────────────────────────
-    
-    /**
-     * Optimized serialization - focuses on code snippets and essential metadata
-     * No reflection, no deep recursion, no unnecessary fields
-     */
-    static org.bson.Document serializeClassOptimized(CtType<?> type) {
-        org.bson.Document doc = new org.bson.Document();
-        
-        // Basic identity
-        doc.put("_id", type.getQualifiedName());
-        doc.put("nodeType", type.getClass().getSimpleName().replace("Impl", ""));
-        doc.put("qualifiedName", type.getQualifiedName());
-        doc.put("simpleName", type.getSimpleName());
-        doc.put("packageName", type.getPackage() != null ? 
-                type.getPackage().getQualifiedName() : "default");
-        doc.put("isInterface", type instanceof CtInterface);
-        doc.put("isEnum", type instanceof CtEnum);
-        doc.put("isAbstract", type.isAbstract());
-        
-        // Source file location (for retrieving original source)
-        try {
-            if (type.getPosition() != null && type.getPosition().getFile() != null) {
-                doc.put("sourceFile", type.getPosition().getFile().getAbsolutePath());
-                doc.put("lineStart", type.getPosition().getLine());
-                doc.put("lineEnd", type.getPosition().getEndLine());
-            }
-        } catch (Exception ignored) {}
-        
-        // Fields (for mock candidate detection)
-        List<org.bson.Document> fields = new ArrayList<>();
-        for (CtField<?> field : type.getFields()) {
-            org.bson.Document fieldDoc = new org.bson.Document();
-            fieldDoc.put("name", field.getSimpleName());
-            fieldDoc.put("type", field.getType() != null ? 
-                    field.getType().getQualifiedName() : "unknown");
-            fieldDoc.put("modifiers", getModifiers(field));
-            fields.add(fieldDoc);
-        }
-        doc.put("fields", fields);
-        
-        // Annotations
-        List<String> annotations = new ArrayList<>();
-        for (CtAnnotation<?> ann : type.getAnnotations()) {
-            try {
-                annotations.add(ann.getAnnotationType().getQualifiedName());
-            } catch (Exception ignored) {}
-        }
-        doc.put("annotations", annotations);
-        
-        // Inheritance
-        try {
-            if (type instanceof CtClass) {
-                CtTypeReference<?> sup = ((CtClass<?>) type).getSuperclass();
-                if (sup != null && !sup.getQualifiedName().equals("java.lang.Object")) {
-                    doc.put("superClass", sup.getQualifiedName());
-                }
-            }
-        } catch (Exception ignored) {}
-        
-        List<String> interfaces = new ArrayList<>();
-        for (CtTypeReference<?> iface : type.getSuperInterfaces()) {
-            try {
-                interfaces.add(iface.getQualifiedName());
-            } catch (Exception ignored) {}
-        }
-        doc.put("superInterfaces", interfaces);
-        
-        // METHODS - This is the most important part for LLM
-        List<org.bson.Document> methodDocs = new ArrayList<>();
-        for (CtMethod<?> method : type.getMethods()) {
-            methodDocs.add(serializeMethodOptimized(method, type.getQualifiedName()));
-        }
-        doc.put("methods", methodDocs);
-        
-        return doc;
-    }
-    
-    /**
-     * Optimized method serialization - captures code as text, not full AST
-     */
-    static org.bson.Document serializeMethodOptimized(CtMethod<?> method, String className) {
-        org.bson.Document doc = new org.bson.Document();
-        
-        // Identity
-        doc.put("name", method.getSimpleName());
-        doc.put("signature", method.getSignature());
-        doc.put("id", methodId(method));
-        
-        // Return type
-        doc.put("returnType", method.getType() != null ? 
-                method.getType().getQualifiedName() : "void");
-        
-        // Parameters
-        List<String> paramTypes = new ArrayList<>();
-        List<String> paramNames = new ArrayList<>();
-        for (CtParameter<?> p : method.getParameters()) {
-            paramTypes.add(p.getType() != null ? p.getType().getQualifiedName() : "unknown");
-            paramNames.add(p.getSimpleName());
-        }
-        doc.put("paramTypes", paramTypes);
-        doc.put("paramNames", paramNames);
-        
-        // Thrown exceptions
-        List<String> thrown = new ArrayList<>();
-        for (CtTypeReference<?> t : method.getThrownTypes()) {
-            thrown.add(t.getQualifiedName());
-        }
-        doc.put("thrownTypes", thrown);
-        
-        // Modifiers
-        doc.put("modifiers", getModifiers(method));
-        
-        // Position (for JaCoCo line mapping)
-        if (method.getPosition().isValidPosition()) {
-            doc.put("lineStart", method.getPosition().getLine());
-            doc.put("lineEnd", method.getPosition().getEndLine());
-        }
-        
-        // ─── THE CODE SNIPPETS (what LLM actually needs) ───
-        
-        // Full method body as text
-        if (method.getBody() != null) {
-            String bodyText = method.getBody().toString();
-            doc.put("body", bodyText);
-            
-            // Extract all conditions for path analysis
-            List<String> conditions = extractConditions(method);
-            doc.put("conditions", conditions);
-            
-            // Extract all return points
-            List<String> returns = extractReturns(method);
-            doc.put("returnPoints", returns);
-            
-            // Simple metrics from text analysis
-            doc.put("lineCount", bodyText.split("\n").length);
-            doc.put("statementCount", method.getBody().getStatements().size());
-        }
-        
-        // Coverage metrics (will be enriched from JaCoCo later)
-        Map<String, Object> metrics = new LinkedHashMap<>();
-        metrics.put("cyclomaticComplexity", computeComplexityFromCode(method));
-        metrics.put("branchCount", countBranches(method));
-        metrics.put("loopCount", countLoops(method));
-        metrics.put("hasNullCheck", hasNullCheck(method));
-        metrics.put("hasInstanceofCheck", hasInstanceofCheck(method));
-        doc.put("metrics", metrics);
-        
-        // Dependencies (to be filled from Neo4j)
-        doc.put("mockCandidates", new ArrayList<String>());
-        doc.put("siblingCalls", new ArrayList<String>());
-        
-        return doc;
-    }
-    
-    /**
-     * Get modifiers as a map
-     */
-    static Map<String, Boolean> getModifiers(CtModifiable mod) {
-        Map<String, Boolean> mods = new LinkedHashMap<>();
-        mods.put("public", mod.isPublic());
-        mods.put("private", mod.isPrivate());
-        mods.put("protected", mod.isProtected());
-        mods.put("static", mod.isStatic());
-        mods.put("abstract", mod.isAbstract());
-        mods.put("final", mod.isFinal());
-        return mods;
-    }
     
     /**
      * Extract all condition expressions from method
@@ -348,29 +184,50 @@ public class OptimizedMain {
         List<String> conditions = new ArrayList<>();
         if (method.getBody() == null) return conditions;
         
-        method.getBody().accept(new CtScanner() {
+        method.getBody().accept(new spoon.reflect.visitor.CtScanner() {
             @Override
             public void visitCtIf(CtIf ifElement) {
-                conditions.add(safe(ifElement.getCondition()));
+                String cond = safe(ifElement.getCondition());
+                if (cond != null && !cond.isEmpty()) {
+                    conditions.add(cond);
+                }
                 super.visitCtIf(ifElement);
             }
             
             @Override
             public <T> void visitCtConditional(CtConditional<T> conditional) {
-                conditions.add(safe(conditional.getCondition()));
+                String cond = safe(conditional.getCondition());
+                if (cond != null && !cond.isEmpty()) {
+                    conditions.add(cond);
+                }
                 super.visitCtConditional(conditional);
             }
             
             @Override
             public void visitCtWhile(CtWhile whileLoop) {
-                conditions.add(safe(whileLoop.getLoopingExpression()));
+                String cond = safe(whileLoop.getLoopingExpression());
+                if (cond != null && !cond.isEmpty()) {
+                    conditions.add(cond);
+                }
                 super.visitCtWhile(whileLoop);
             }
             
             @Override
             public void visitCtFor(CtFor forLoop) {
-                conditions.add(safe(forLoop.getExpression()));
+                String cond = safe(forLoop.getExpression());
+                if (cond != null && !cond.isEmpty()) {
+                    conditions.add(cond);
+                }
                 super.visitCtFor(forLoop);
+            }
+            
+            @Override
+            public void visitCtDo(CtDo doLoop) {
+                String cond = safe(doLoop.getLoopingExpression());
+                if (cond != null && !cond.isEmpty()) {
+                    conditions.add(cond);
+                }
+                super.visitCtDo(doLoop);
             }
         });
         
@@ -378,16 +235,21 @@ public class OptimizedMain {
     }
     
     /**
-     * Extract all return statements
+     * Extract all return expressions
      */
     static List<String> extractReturns(CtMethod<?> method) {
         List<String> returns = new ArrayList<>();
         if (method.getBody() == null) return returns;
         
-        method.getBody().accept(new CtScanner() {
+        method.getBody().accept(new spoon.reflect.visitor.CtScanner() {
             @Override
             public <T> void visitCtReturn(CtReturn<T> returnStmt) {
-                returns.add(safe(returnStmt.getReturnedExpression()));
+                String expr = safe(returnStmt.getReturnedExpression());
+                if (expr != null) {
+                    returns.add(expr);
+                } else {
+                    returns.add("void");
+                }
                 super.visitCtReturn(returnStmt);
             }
         });
@@ -396,59 +258,216 @@ public class OptimizedMain {
     }
     
     /**
-     * Compute cyclomatic complexity from code text (fast approximation)
+     * Extract all null check expressions
      */
-    static int computeComplexityFromCode(CtMethod<?> method) {
-        if (method.getBody() == null) return 1;
-        String body = method.getBody().toString();
+    static List<String> extractNullChecks(CtMethod<?> method) {
+        List<String> nullChecks = new ArrayList<>();
+        if (method.getBody() == null) return nullChecks;
         
-        int complexity = 1;
-        complexity += countOccurrences(body, "if");
-        complexity += countOccurrences(body, "?");
-        complexity += countOccurrences(body, "for");
-        complexity += countOccurrences(body, "while");
-        complexity += countOccurrences(body, "catch");
-        complexity += countOccurrences(body, "&&");
-        complexity += countOccurrences(body, "||");
-        complexity += countOccurrences(body, "case ");
+        method.getBody().accept(new spoon.reflect.visitor.CtScanner() {
+            @Override
+            public <T> void visitCtBinaryOperator(CtBinaryOperator<T> op) {
+                String kind = safe(op.getKind());
+                if ("EQ".equals(kind) || "NE".equals(kind)) {
+                    String left = safe(op.getLeftHandOperand());
+                    String right = safe(op.getRightHandOperand());
+                    if ("null".equals(left) || "null".equals(right)) {
+                        nullChecks.add(left + " " + (kind.equals("EQ") ? "==" : "!=") + " " + right);
+                    }
+                }
+                super.visitCtBinaryOperator(op);
+            }
+        });
         
-        return Math.min(complexity, 50); // Cap at 50
+        return nullChecks;
     }
     
-    static int countOccurrences(String text, String sub) {
-        int count = 0, idx = 0;
-        while ((idx = text.indexOf(sub, idx)) != -1) {
-            count++;
-            idx += sub.length();
+    /**
+     * Extract all instanceof checks
+     */
+    static List<String> extractInstanceChecks(CtMethod<?> method) {
+        List<String> instanceChecks = new ArrayList<>();
+        if (method.getBody() == null) return instanceChecks;
+        
+        method.getBody().accept(new spoon.reflect.visitor.CtScanner() {
+            @Override
+            public <T> void visitCtBinaryOperator(CtBinaryOperator<T> op) {
+                String kind = safe(op.getKind());
+                if ("INSTANCEOF".equals(kind)) {
+                    String left = safe(op.getLeftHandOperand());
+                    String right = safe(op.getRightHandOperand());
+                    instanceChecks.add(left + " instanceof " + right);
+                }
+                super.visitCtBinaryOperator(op);
+            }
+        });
+        
+        return instanceChecks;
+    }
+    
+    /**
+     * Extract mock candidates from fields
+     */
+    static List<String> extractMockCandidates(CtType<?> type) {
+        List<String> candidates = new ArrayList<>();
+        for (CtField<?> field : type.getFields()) {
+            String fieldType = field.getType() != null ? field.getType().getQualifiedName() : null;
+            String fieldName = field.getSimpleName();
+            
+            if (isMockCandidate(fieldType, fieldName)) {
+                candidates.add(fieldName + ":" + fieldType);
+            }
         }
-        return count;
-    }
-    
-    static int countBranches(CtMethod<?> method) {
-        if (method.getBody() == null) return 0;
-        String body = method.getBody().toString();
-        return countOccurrences(body, "if") + countOccurrences(body, "?");
-    }
-    
-    static int countLoops(CtMethod<?> method) {
-        if (method.getBody() == null) return 0;
-        String body = method.getBody().toString();
-        return countOccurrences(body, "for") + countOccurrences(body, "while");
-    }
-    
-    static boolean hasNullCheck(CtMethod<?> method) {
-        if (method.getBody() == null) return false;
-        String body = method.getBody().toString();
-        return body.contains("== null") || body.contains("!= null");
-    }
-    
-    static boolean hasInstanceofCheck(CtMethod<?> method) {
-        if (method.getBody() == null) return false;
-        return method.getBody().toString().contains("instanceof");
+        return candidates;
     }
     
     // ─────────────────────────────────────────────────────────────────────────
-    // DEPENDENCY GRAPH EXTRACTION (Optimized)
+    // JSON SERIALIZATION
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    static ObjectNode serializeClassToJson(CtType<?> type) {
+        ObjectNode node = mapper.createObjectNode();
+        
+        // Basic identity
+        node.put("_id", type.getQualifiedName());
+        node.put("qualifiedName", type.getQualifiedName());
+        node.put("simpleName", type.getSimpleName());
+        node.put("packageName", type.getPackage() != null ? 
+                type.getPackage().getQualifiedName() : "default");
+        node.put("isInterface", type instanceof CtInterface);
+        node.put("isEnum", type instanceof CtEnum);
+        node.put("isAbstract", type.isAbstract());
+        
+        // Source location
+        try {
+            if (type.getPosition() != null && type.getPosition().getFile() != null) {
+                node.put("sourceFile", type.getPosition().getFile().getAbsolutePath());
+                node.put("lineStart", type.getPosition().getLine());
+                node.put("lineEnd", type.getPosition().getEndLine());
+            }
+        } catch (Exception ignored) {}
+        
+        // Fields (for mock detection)
+        ArrayNode fields = node.putArray("fields");
+        for (CtField<?> field : type.getFields()) {
+            ObjectNode fieldNode = fields.addObject();
+            fieldNode.put("name", field.getSimpleName());
+            fieldNode.put("type", field.getType() != null ? 
+                    field.getType().getQualifiedName() : "unknown");
+            fieldNode.put("isStatic", field.isStatic());
+            fieldNode.put("isFinal", field.isFinal());
+        }
+        
+        // Annotations
+        ArrayNode annotations = node.putArray("annotations");
+        for (CtAnnotation<?> ann : type.getAnnotations()) {
+            try {
+                annotations.add(ann.getAnnotationType().getQualifiedName());
+            } catch (Exception ignored) {}
+        }
+        
+        // Inheritance
+        try {
+            if (type instanceof CtClass) {
+                CtTypeReference<?> sup = ((CtClass<?>) type).getSuperclass();
+                if (sup != null && !sup.getQualifiedName().equals("java.lang.Object")) {
+                    node.put("superClass", sup.getQualifiedName());
+                }
+            }
+        } catch (Exception ignored) {}
+        
+        ArrayNode interfaces = node.putArray("superInterfaces");
+        for (CtTypeReference<?> iface : type.getSuperInterfaces()) {
+            try {
+                interfaces.add(iface.getQualifiedName());
+            } catch (Exception ignored) {}
+        }
+        
+        // Mock candidates (for test generation)
+        ArrayNode mockCandidates = node.putArray("mockCandidates");
+        for (String candidate : extractMockCandidates(type)) {
+            mockCandidates.add(candidate);
+        }
+        
+        // Methods
+        ArrayNode methodsNode = node.putArray("methods");
+        for (CtMethod<?> method : type.getMethods()) {
+            methodsNode.add(serializeMethodToJson(method, type.getQualifiedName()));
+        }
+        
+        return node;
+    }
+    
+    static ObjectNode serializeMethodToJson(CtMethod<?> method, String className) {
+        ObjectNode node = mapper.createObjectNode();
+        
+        // Identity
+        node.put("name", method.getSimpleName());
+        node.put("signature", method.getSignature());
+        node.put("id", methodId(method));
+        
+        // Return type
+        node.put("returnType", method.getType() != null ? 
+                method.getType().getQualifiedName() : "void");
+        
+        // Parameters
+        ArrayNode paramTypes = node.putArray("paramTypes");
+        ArrayNode paramNames = node.putArray("paramNames");
+        for (CtParameter<?> p : method.getParameters()) {
+            paramTypes.add(p.getType() != null ? p.getType().getQualifiedName() : "unknown");
+            paramNames.add(p.getSimpleName());
+        }
+        
+        // Modifiers
+        ObjectNode modifiers = node.putObject("modifiers");
+        modifiers.put("public", method.isPublic());
+        modifiers.put("private", method.isPrivate());
+        modifiers.put("protected", method.isProtected());
+        modifiers.put("static", method.isStatic());
+        modifiers.put("abstract", method.isAbstract());
+        modifiers.put("final", method.isFinal());
+        
+        // Position (for JaCoCo line mapping)
+        if (method.getPosition().isValidPosition()) {
+            node.put("lineStart", method.getPosition().getLine());
+            node.put("lineEnd", method.getPosition().getEndLine());
+        }
+        
+        // ─── CODE SNIPPETS (What LLM needs for test generation) ───
+        
+        if (method.getBody() != null) {
+            // Full method body
+            String bodyText = method.getBody().toString();
+            node.put("body", bodyText.length() > 10000 ? 
+                    bodyText.substring(0, 10000) + "\n// ... truncated ..." : bodyText);
+            
+            // Conditions (for path analysis)
+            ArrayNode conditions = node.putArray("conditions");
+            extractConditions(method).forEach(conditions::add);
+            
+            // Return points
+            ArrayNode returns = node.putArray("returnPoints");
+            extractReturns(method).forEach(returns::add);
+            
+            // Null checks
+            ArrayNode nullChecks = node.putArray("nullChecks");
+            extractNullChecks(method).forEach(nullChecks::add);
+            
+            // Instanceof checks
+            ArrayNode instanceChecks = node.putArray("instanceChecks");
+            extractInstanceChecks(method).forEach(instanceChecks::add);
+        }
+        
+        // Dependency info (to be filled from graph)
+        node.putArray("mockCandidates");
+        node.putArray("siblingCalls");
+        node.putArray("externalCalls");
+        
+        return node;
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // DEPENDENCY GRAPH EXTRACTION
     // ─────────────────────────────────────────────────────────────────────────
     
     static void extractCallGraph(CtModel model) {
@@ -469,10 +488,24 @@ public class OptimizedMain {
             cn.isEnum = (type instanceof CtEnum);
             cn.astDocId = cn.qualifiedName;
             
+            try {
+                if (type.getPosition() != null && type.getPosition().getFile() != null) {
+                    cn.sourceFile = type.getPosition().getFile().getAbsolutePath();
+                    cn.lineStart = type.getPosition().getLine();
+                    cn.lineEnd = type.getPosition().getEndLine();
+                }
+            } catch (Exception ignored) {}
+            
             for (CtField<?> f : type.getFields()) {
                 cn.fieldNames.add(f.getSimpleName());
                 cn.fieldTypes.add(f.getType() != null ? 
                         f.getType().getQualifiedName() : "unknown");
+            }
+            
+            for (CtAnnotation<?> a : type.getAnnotations()) {
+                try {
+                    cn.annotations.add(a.getAnnotationType().getQualifiedName());
+                } catch (Exception ignored) {}
             }
             
             try {
@@ -507,6 +540,7 @@ public class OptimizedMain {
         for (CtType<?> type : model.getAllTypes()) {
             if (isAnonymous(type)) continue;
             String cqn = classId(type);
+            List<String> mockCandidates = extractMockCandidates(type);
             
             for (CtMethod<?> method : type.getMethods()) {
                 String mId = methodId(method);
@@ -527,6 +561,7 @@ public class OptimizedMain {
                 mn.isProtected = method.isProtected();
                 mn.isStatic = method.isStatic();
                 mn.isAbstract = method.isAbstract();
+                mn.isFinal = method.isFinal();
                 mn.astDocId = cqn;
                 mn.neo4jId = mId;
                 
@@ -543,6 +578,17 @@ public class OptimizedMain {
                 for (CtParameter<?> p : method.getParameters()) {
                     mn.paramTypes.add(p.getType() != null ? 
                             p.getType().getQualifiedName() : "unknown");
+                    mn.paramNames.add(p.getSimpleName());
+                }
+                
+                for (CtTypeReference<?> t : method.getThrownTypes()) {
+                    mn.thrownTypes.add(t.getQualifiedName());
+                }
+                
+                for (CtAnnotation<?> a : method.getAnnotations()) {
+                    try {
+                        mn.annotations.add(a.getAnnotationType().getQualifiedName());
+                    } catch (Exception ignored) {}
                 }
                 
                 // Code snippets
@@ -550,19 +596,20 @@ public class OptimizedMain {
                     mn.methodBody = method.getBody().toString();
                     mn.conditions = extractConditions(method);
                     mn.returnPoints = extractReturns(method);
+                    mn.nullChecks = extractNullChecks(method);
+                    mn.instanceChecks = extractInstanceChecks(method);
                 }
                 
-                // Metrics
-                mn.cyclomaticComplexity = computeComplexityFromCode(method);
-                mn.branchCount = countBranches(method);
-                mn.loopCount = countLoops(method);
-                mn.hasNullCheck = hasNullCheck(method);
-                mn.hasInstanceofCheck = hasInstanceofCheck(method);
+                // Mock candidates from class fields
+                mn.mockCandidates.addAll(mockCandidates);
                 
                 methods.put(mId, mn);
                 edges.add(edge(cqn, mId, "HAS_METHOD"));
                 
-                // Extract calls (simplified)
+                // Extract calls
+                Set<String> siblingSet = new HashSet<>();
+                Set<String> externalSet = new HashSet<>();
+                
                 try {
                     for (CtInvocation<?> inv : method.getElements(
                             new TypeFilter<>(CtInvocation.class))) {
@@ -577,6 +624,15 @@ public class OptimizedMain {
                             
                             String targetId = targetClass + "#" + methodName;
                             boolean ext = isExternalClass(targetClass);
+                            
+                            // Check if it's a sibling call (same class)
+                            if (targetClass.equals(cqn)) {
+                                siblingSet.add(methodName);
+                            }
+                            
+                            if (ext) {
+                                externalSet.add(targetClass + "." + methodName);
+                            }
                             
                             if (ext && !methods.containsKey(targetId)) {
                                 MethodNode em = new MethodNode();
@@ -593,6 +649,9 @@ public class OptimizedMain {
                         } catch (Exception ignored) {}
                     }
                 } catch (Exception ignored) {}
+                
+                mn.siblingCalls.addAll(siblingSet);
+                mn.externalCalls.addAll(externalSet);
             }
         }
         
@@ -615,12 +674,16 @@ public class OptimizedMain {
         
         System.out.println("╔══════════════════════════════════════════════════════════╗");
         System.out.println("║     OPTIMIZED Coverage Analyzer - Harmony Codebase       ║");
+        System.out.println("║     (JaCoCo provides complexity, we provide context)     ║");
         System.out.println("╚══════════════════════════════════════════════════════════╝\n");
         
         // ── CONFIG ─────────────────────────────────────────────────────────────────
         String rootPath = "C:/Users/PrabalBhardwaj/Desktop/osttra-harmony3/";
+        String astDir = rootPath + "ast/";
         String graphJson = rootPath + "dependency_graph.json";
         String methodIndexPath = rootPath + "method_index.json";
+        
+        new File(astDir).mkdirs();
         
         // Auto-discover source folders
         File root = new File(rootPath);
@@ -628,7 +691,8 @@ public class OptimizedMain {
         for (File f : Objects.requireNonNull(root.listFiles())) {
             if (f.isDirectory() && !f.getName().startsWith(".") && 
                 !f.getName().equals("ast") && !f.getName().equals("build") &&
-                !f.getName().equals("target") && !f.getName().equals("lib")) {
+                !f.getName().equals("target") && !f.getName().equals("lib") &&
+                !f.getName().equals("Bundles") && !f.getName().equals("Scanned")) {
                 if (containsJava(f)) {
                     srcFolders.add(f.getAbsolutePath());
                     System.out.println("  📁 Source folder: " + f.getName());
@@ -648,62 +712,36 @@ public class OptimizedMain {
         launcher.getEnvironment().setIgnoreDuplicateDeclarations(true);
         launcher.getEnvironment().setIgnoreSyntaxErrors(true);
         launcher.getEnvironment().setComplianceLevel(11);
-        launcher.getEnvironment().setAutoImports(false);  // Disable auto-imports for speed
+        launcher.getEnvironment().setAutoImports(false);
         
         launcher.buildModel();
         CtModel model = launcher.getModel();
         
         System.out.println("  ✅ Model built in: " + (System.currentTimeMillis() - modelStart) + "ms");
         
-        // ── OPTION 1: Direct MongoDB Insert (Recommended) ────────────────────────
-        if (USE_MONGODB) {
-            System.out.println("\n📦 Connecting to MongoDB...");
-            mongoClient = com.mongodb.client.MongoClients.create("mongodb://localhost:27017");
-            com.mongodb.client.MongoDatabase db = mongoClient.getDatabase("harmony_codebase");
-            astCollection = db.getCollection("ast_nodes");
-            
-            // Drop existing collection for fresh start
-            astCollection.drop();
-            System.out.println("  ✅ Connected, ready to insert");
-        }
-        
-        // ── PASS 1: AST Serialization (Parallel) ─────────────────────────────────
-        System.out.println("\n📄 Pass 1: Serializing AST (parallel)...");
+        // ── PASS 1: AST Serialization ────────────────────────────────────────────
+        System.out.println("\n📄 Pass 1: Serializing AST to JSON files...");
         
         AtomicInteger astCount = new AtomicInteger(0);
         AtomicInteger astErrors = new AtomicInteger(0);
+        
         List<CtType<?>> types = model.getAllTypes().stream()
                 .filter(t -> !isAnonymous(t))
-                .collect(Collectors.toList());
+                .collect(java.util.stream.Collectors.toList());
         
         System.out.println("  Total types to process: " + types.size());
         
-        // For batch MongoDB insert
-        List<org.bson.Document> batch = new ArrayList<>();
-        
-        // Process in parallel
-        types.parallelStream().forEach(type -> {
+        // Process sequentially to avoid file write conflicts
+        for (CtType<?> type : types) {
             try {
-                org.bson.Document doc = serializeClassOptimized(type);
+                ObjectNode doc = serializeClassToJson(type);
                 
-                if (USE_MONGODB) {
-                    synchronized (batch) {
-                        batch.add(doc);
-                        if (batch.size() >= BATCH_SIZE) {
-                            astCollection.insertMany(new ArrayList<>(batch));
-                            batch.clear();
-                        }
-                    }
-                } else if (WRITE_FILES) {
-                    String fname = type.getQualifiedName().replace(".", "_") + ".json";
-                    synchronized (mapper) {
-                        mapper.writerWithDefaultPrettyPrinter()
-                              .writeValue(new File(rootPath + "ast/" + fname), doc);
-                    }
-                }
+                String fname = type.getQualifiedName().replace(".", "_") + ".json";
+                mapper.writerWithDefaultPrettyPrinter()
+                      .writeValue(new File(astDir + fname), doc);
                 
                 int count = astCount.incrementAndGet();
-                if (count % 500 == 0) {
+                if (count % BATCH_PROGRESS == 0) {
                     System.out.println("    Processed " + count + " / " + types.size() + " classes");
                 }
                 
@@ -713,14 +751,9 @@ public class OptimizedMain {
                     System.err.println("    Error: " + type.getQualifiedName() + " - " + e.getMessage());
                 }
             }
-        });
-        
-        // Insert remaining batch
-        if (USE_MONGODB && !batch.isEmpty()) {
-            astCollection.insertMany(batch);
         }
         
-        System.out.println("  ✅ AST serialized: " + astCount.get() + " classes" +
+        System.out.println("  ✅ AST files written: " + astCount.get() + 
                 (astErrors.get() > 0 ? " (" + astErrors.get() + " errors)" : ""));
         
         // ── PASS 2: Call Graph ───────────────────────────────────────────────────
@@ -738,24 +771,32 @@ public class OptimizedMain {
         ObjectNode nodesObj = rootNode.putObject("nodes");
         
         // Convert to JSON-friendly format
-        nodesObj.set("methods", mapper.valueToTree(methods.values().stream()
-                .map(m -> {
-                    Map<String, Object> map = new LinkedHashMap<>();
-                    map.put("id", m.id);
-                    map.put("simpleName", m.simpleName);
-                    map.put("className", m.className);
-                    map.put("packageName", m.packageName);
-                    map.put("returnType", m.returnType);
-                    map.put("isPublic", m.isPublic);
-                    map.put("isStatic", m.isStatic);
-                    map.put("cyclomaticComplexity", m.cyclomaticComplexity);
-                    map.put("lineStart", m.lineStart);
-                    map.put("lineEnd", m.lineEnd);
-                    map.put("astDocId", m.astDocId);
-                    map.put("isExternal", m.isExternal);
-                    return map;
-                }).collect(Collectors.toList())));
+        List<Map<String, Object>> methodList = new ArrayList<>();
+        for (MethodNode mn : methods.values()) {
+            if (mn.isExternal) continue;
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("id", mn.id);
+            map.put("simpleName", mn.simpleName);
+            map.put("className", mn.className);
+            map.put("packageName", mn.packageName);
+            map.put("returnType", mn.returnType);
+            map.put("paramTypes", mn.paramTypes);
+            map.put("paramNames", mn.paramNames);
+            map.put("isPublic", mn.isPublic);
+            map.put("isStatic", mn.isStatic);
+            map.put("lineStart", mn.lineStart);
+            map.put("lineEnd", mn.lineEnd);
+            map.put("astDocId", mn.astDocId);
+            map.put("mockCandidates", mn.mockCandidates);
+            map.put("siblingCalls", mn.siblingCalls);
+            map.put("externalCalls", mn.externalCalls);
+            map.put("conditions", mn.conditions);
+            map.put("returnPoints", mn.returnPoints);
+            map.put("nullChecks", mn.nullChecks);
+            methodList.add(map);
+        }
         
+        nodesObj.set("methods", mapper.valueToTree(methodList));
         nodesObj.set("classes", mapper.valueToTree(classes.values()));
         nodesObj.set("packages", mapper.valueToTree(packages.values()));
         rootNode.set("edges", mapper.valueToTree(edges));
@@ -763,17 +804,16 @@ public class OptimizedMain {
         // Stats
         ObjectNode stats = rootNode.putObject("stats");
         stats.put("totalClasses", classes.size());
-        stats.put("totalMethods", methods.values().stream().filter(m -> !m.isExternal).count());
-        stats.put("totalExternalMethods", methods.values().stream().filter(m -> m.isExternal).count());
+        stats.put("totalMethods", methodList.size());
         stats.put("totalPackages", packages.size());
         stats.put("totalEdges", edges.size());
         stats.put("astFilesWritten", astCount.get());
-        stats.put("processingTimeMs", System.currentTimeMillis() - startTime);
+        stats.put("processingTimeSeconds", (System.currentTimeMillis() - startTime) / 1000);
         
         mapper.writerWithDefaultPrettyPrinter()
               .writeValue(new File(graphJson), rootNode);
         
-        // ── Write method_index.json (for fast LLM lookup) ───────────────────────
+        // ── Write method_index.json ─────────────────────────────────────────────
         System.out.println("📇 Writing method index...");
         
         ObjectNode methodIndex = mapper.createObjectNode();
@@ -785,20 +825,22 @@ public class OptimizedMain {
             entry.put("methodName", mn.simpleName);
             entry.put("lineStart", mn.lineStart);
             entry.put("lineEnd", mn.lineEnd);
-            entry.put("cyclomaticComplexity", mn.cyclomaticComplexity);
-            entry.put("branchCount", mn.branchCount);
-            entry.put("loopCount", mn.loopCount);
-            entry.put("hasNullCheck", mn.hasNullCheck);
-            entry.put("hasInstanceofCheck", mn.hasInstanceofCheck);
+            entry.put("returnType", mn.returnType);
+            entry.put("paramTypes", mapper.valueToTree(mn.paramTypes));
+            entry.put("paramNames", mapper.valueToTree(mn.paramNames));
+            entry.put("mockCandidates", mapper.valueToTree(mn.mockCandidates));
+            entry.put("siblingCalls", mapper.valueToTree(mn.siblingCalls));
+            entry.put("externalCalls", mapper.valueToTree(mn.externalCalls));
             
-            // Store code snippets for quick LLM access
+            // Code snippets for quick LLM access
             if (mn.methodBody != null) {
                 entry.put("body", mn.methodBody.length() > 5000 ? 
                         mn.methodBody.substring(0, 5000) + "..." : mn.methodBody);
             }
-            if (mn.conditions != null) {
-                entry.set("conditions", mapper.valueToTree(mn.conditions));
-            }
+            entry.put("conditions", mapper.valueToTree(mn.conditions));
+            entry.put("returnPoints", mapper.valueToTree(mn.returnPoints));
+            entry.put("nullChecks", mapper.valueToTree(mn.nullChecks));
+            entry.put("instanceChecks", mapper.valueToTree(mn.instanceChecks));
         }
         
         mapper.writerWithDefaultPrettyPrinter()
@@ -812,21 +854,19 @@ public class OptimizedMain {
         System.out.println("╠══════════════════════════════════════════════════════════╣");
         System.out.println("║ Total time:        " + String.format("%.2f", totalTime / 1000.0) + " seconds");
         System.out.println("║ Classes processed: " + astCount.get());
-        System.out.println("║ Methods indexed:   " + methods.values().stream().filter(m -> !m.isExternal).count());
+        System.out.println("║ Methods indexed:   " + methodList.size());
         System.out.println("║ Graph edges:       " + edges.size());
         System.out.println("╠══════════════════════════════════════════════════════════╣");
         System.out.println("║ Outputs:                                                  ║");
-        System.out.println("║   - dependency_graph.json                                 ║");
-        System.out.println("║   - method_index.json                                     ║");
-        if (USE_MONGODB) {
-            System.out.println("║   - MongoDB: harmony_codebase.ast_nodes                ║");
-        }
+        System.out.println("║   - ast/*.json (class AST files)                         ║");
+        System.out.println("║   - dependency_graph.json (Neo4j)                        ║");
+        System.out.println("║   - method_index.json (LLM lookup)                       ║");
+        System.out.println("╠══════════════════════════════════════════════════════════╣");
+        System.out.println("║ Next steps:                                              ║");
+        System.out.println("║   1. Parse JaCoCo XML to get uncovered methods           ║");
+        System.out.println("║   2. Look up method in method_index.json                 ║");
+        System.out.println("║   3. Send to LLM: code + dependencies + mock candidates  ║");
         System.out.println("╚══════════════════════════════════════════════════════════╝");
-        
-        // Cleanup
-        if (mongoClient != null) {
-            mongoClient.close();
-        }
     }
     
     static boolean containsJava(File dir) {

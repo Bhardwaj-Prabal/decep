@@ -1,0 +1,687 @@
+import org.jgrapht.Graph;
+import org.jgrapht.graph.DefaultDirectedGraph;
+import org.jgrapht.graph.DefaultEdge;
+import org.jgrapht.graph.AsSubgraph;
+import org.jgrapht.traverse.BreadthFirstIterator;
+import org.jgrapht.alg.shortestpath.DijkstraShortestPath;
+import org.jgrapht.alg.cycle.CycleDetector;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import java.io.File;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * In-Memory Graph Storage using JGraphT
+ * Stores dependency graph in memory for fast queries
+ */
+public class InMemoryGraphStorage {
+    
+    // Graph with custom edges that can store properties
+    private final Graph<GraphNode, GraphEdge> graph;
+    private final Map<String, GraphNode> nodeMap;
+    private final ObjectMapper mapper;
+    
+    // Node types
+    public enum NodeType {
+        METHOD, CLASS, PACKAGE
+    }
+    
+    /**
+     * Graph Node with metadata
+     */
+    public static class GraphNode {
+        public final String id;
+        public final NodeType type;
+        public final Map<String, Object> properties;
+        
+        public GraphNode(String id, NodeType type) {
+            this.id = id;
+            this.type = type;
+            this.properties = new ConcurrentHashMap<>();
+        }
+        
+        public void put(String key, Object value) {
+            properties.put(key, value);
+        }
+        
+        public Object get(String key) {
+            return properties.get(key);
+        }
+        
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            GraphNode node = (GraphNode) o;
+            return Objects.equals(id, node.id);
+        }
+        
+        @Override
+        public int hashCode() {
+            return Objects.hash(id);
+        }
+        
+        @Override
+        public String toString() {
+            return id + " (" + type + ")";
+        }
+    }
+    
+    /**
+     * Graph Edge with properties
+     */
+    public static class GraphEdge extends DefaultEdge {
+        private final Map<String, Object> properties;
+        private final String type;
+        
+        public GraphEdge(String type) {
+            this.type = type;
+            this.properties = new ConcurrentHashMap<>();
+        }
+        
+        public void put(String key, Object value) {
+            properties.put(key, value);
+        }
+        
+        public Object get(String key) {
+            return properties.get(key);
+        }
+        
+        public String getType() {
+            return type;
+        }
+        
+        public Map<String, Object> getProperties() {
+            return properties;
+        }
+        
+        @Override
+        public String toString() {
+            return type + (properties.isEmpty() ? "" : " " + properties);
+        }
+    }
+    
+    /**
+     * Constructor - Initialize empty graph
+     */
+    public InMemoryGraphStorage() {
+        this.graph = new DefaultDirectedGraph<>(GraphEdge.class);
+        this.nodeMap = new ConcurrentHashMap<>();
+        this.mapper = new ObjectMapper();
+    }
+    
+    /**
+     * Add a node to the graph
+     */
+    public GraphNode addNode(String id, NodeType type) {
+        return addNode(id, type, null);
+    }
+    
+    /**
+     * Add a node with properties
+     */
+    public GraphNode addNode(String id, NodeType type, Map<String, Object> properties) {
+        GraphNode node = nodeMap.computeIfAbsent(id, k -> new GraphNode(k, type));
+        graph.addVertex(node);
+        if (properties != null) {
+            node.properties.putAll(properties);
+        }
+        return node;
+    }
+    
+    /**
+     * Get a node by ID
+     */
+    public GraphNode getNode(String id) {
+        return nodeMap.get(id);
+    }
+    
+    /**
+     * Add an edge between two nodes
+     */
+    public GraphEdge addEdge(String fromId, String toId, String edgeType) {
+        return addEdge(fromId, toId, edgeType, null);
+    }
+    
+    /**
+     * Add an edge with properties
+     */
+    public GraphEdge addEdge(String fromId, String toId, String edgeType, Map<String, Object> properties) {
+        GraphNode from = getNode(fromId);
+        GraphNode to = getNode(toId);
+        
+        if (from == null) {
+            throw new IllegalArgumentException("Source node not found: " + fromId);
+        }
+        if (to == null) {
+            throw new IllegalArgumentException("Target node not found: " + toId);
+        }
+        
+        GraphEdge edge = new GraphEdge(edgeType);
+        if (properties != null) {
+            edge.properties.putAll(properties);
+        }
+        
+        graph.addEdge(from, to, edge);
+        return edge;
+    }
+    
+    /**
+     * Get all edges from a node
+     */
+    public Set<GraphEdge> getOutgoingEdges(String nodeId) {
+        GraphNode node = getNode(nodeId);
+        if (node == null) return Collections.emptySet();
+        return graph.outgoingEdgesOf(node);
+    }
+    
+    /**
+     * Get all edges to a node
+     */
+    public Set<GraphEdge> getIncomingEdges(String nodeId) {
+        GraphNode node = getNode(nodeId);
+        if (node == null) return Collections.emptySet();
+        return graph.incomingEdgesOf(node);
+    }
+    
+    /**
+     * Get all successors (nodes this node points to)
+     */
+    public Set<GraphNode> getSuccessors(String nodeId) {
+        GraphNode node = getNode(nodeId);
+        if (node == null) return Collections.emptySet();
+        return graph.outgoingEdgesOf(node).stream()
+            .map(graph::getEdgeTarget)
+            .collect(java.util.stream.Collectors.toSet());
+    }
+    
+    /**
+     * Get all predecessors (nodes that point to this node)
+     */
+    public Set<GraphNode> getPredecessors(String nodeId) {
+        GraphNode node = getNode(nodeId);
+        if (node == null) return Collections.emptySet();
+        return graph.incomingEdgesOf(node).stream()
+            .map(graph::getEdgeSource)
+            .collect(java.util.stream.Collectors.toSet());
+    }
+    
+    /**
+     * Find all callers of a method (reverse call graph)
+     */
+    public List<GraphNode> getCallers(String methodId) {
+        return getPredecessors(methodId).stream()
+            .filter(node -> node.type == NodeType.METHOD)
+            .collect(java.util.stream.Collectors.toList());
+    }
+    
+    /**
+     * Find all callees of a method (forward call graph)
+     */
+    public List<GraphNode> getCallees(String methodId) {
+        return getSuccessors(methodId).stream()
+            .filter(node -> node.type == NodeType.METHOD)
+            .collect(java.util.stream.Collectors.toList());
+    }
+    
+    /**
+     * Find all methods in a class
+     */
+    public List<GraphNode> getMethodsInClass(String className) {
+        GraphNode classNode = getNode(className);
+        if (classNode == null || classNode.type != NodeType.CLASS) {
+            return Collections.emptyList();
+        }
+        
+        return getSuccessors(className).stream()
+            .filter(node -> node.type == NodeType.METHOD)
+            .filter(node -> {
+                String nodeClassName = (String) node.get("className");
+                return className.equals(nodeClassName);
+            })
+            .collect(java.util.stream.Collectors.toList());
+    }
+    
+    /**
+     * Find methods that call external services
+     */
+    public List<GraphNode> findMethodsWithExternalCalls() {
+        return nodeMap.values().stream()
+            .filter(node -> node.type == NodeType.METHOD)
+            .filter(node -> {
+                List<String> externalCalls = (List<String>) node.get("externalCalls");
+                return externalCalls != null && !externalCalls.isEmpty();
+            })
+            .collect(java.util.stream.Collectors.toList());
+    }
+    
+    /**
+     * Find methods that need mocking (have external calls or sibling calls)
+     */
+    public List<GraphNode> findMethodsNeedingMocks() {
+        return nodeMap.values().stream()
+            .filter(node -> node.type == NodeType.METHOD)
+            .filter(node -> {
+                List<String> externalCalls = (List<String>) node.get("externalCalls");
+                List<String> siblingCalls = (List<String>) node.get("siblingCalls");
+                return (externalCalls != null && !externalCalls.isEmpty()) ||
+                       (siblingCalls != null && !siblingCalls.isEmpty());
+            })
+            .collect(java.util.stream.Collectors.toList());
+    }
+    
+    /**
+     * Find paths between two methods (for impact analysis)
+     */
+    public List<List<GraphNode>> findPaths(String fromMethodId, String toMethodId) {
+        GraphNode from = getNode(fromMethodId);
+        GraphNode to = getNode(toMethodId);
+        
+        if (from == null || to == null) {
+            return Collections.emptyList();
+        }
+        
+        DijkstraShortestPath<GraphNode, GraphEdge> dijkstra = 
+            new DijkstraShortestPath<>(graph);
+        
+        List<GraphNode> path = dijkstra.getPath(from, to).getVertexList();
+        return path.isEmpty() ? Collections.emptyList() : Collections.singletonList(path);
+    }
+    
+    /**
+     * Detect cycles in the call graph
+     */
+    public Set<GraphNode> detectCycles() {
+        CycleDetector<GraphNode, GraphEdge> detector = new CycleDetector<>(graph);
+        return detector.findCycles();
+    }
+    
+    /**
+     * Get all methods with their call counts (popularity)
+     */
+    public Map<String, Integer> getMethodCallCounts() {
+        Map<String, Integer> callCounts = new HashMap<>();
+        
+        for (GraphEdge edge : graph.edgeSet()) {
+            GraphNode target = graph.getEdgeTarget(edge);
+            if (target.type == NodeType.METHOD) {
+                callCounts.merge(target.id, 1, Integer::sum);
+            }
+        }
+        
+        return callCounts;
+    }
+    
+    /**
+     * Export graph to JSON (for debugging/saving)
+     */
+    public ObjectNode exportToJson() {
+        ObjectNode root = mapper.createObjectNode();
+        ObjectNode nodes = root.putObject("nodes");
+        ObjectNode edges = root.putObject("edges");
+        
+        // Export nodes
+        for (GraphNode node : nodeMap.values()) {
+            ObjectNode nodeJson = nodes.putObject(node.id);
+            nodeJson.put("type", node.type.toString());
+            nodeJson.putPOJO("properties", node.properties);
+        }
+        
+        // Export edges
+        int edgeIndex = 0;
+        for (GraphEdge edge : graph.edgeSet()) {
+            GraphNode source = graph.getEdgeSource(edge);
+            GraphNode target = graph.getEdgeTarget(edge);
+            ObjectNode edgeJson = edges.putObject("edge_" + edgeIndex++);
+            edgeJson.put("from", source.id);
+            edgeJson.put("to", target.id);
+            edgeJson.put("type", edge.getType());
+            edgeJson.putPOJO("properties", edge.getProperties());
+        }
+        
+        return root;
+    }
+    
+    /**
+     * Load graph from dependency_graph.json
+     */
+    public void loadFromFile(String graphJsonPath) throws Exception {
+        System.out.println("\n📦 Loading graph from: " + graphJsonPath);
+        
+        File graphFile = new File(graphJsonPath);
+        if (!graphFile.exists()) {
+            throw new IllegalArgumentException("File not found: " + graphJsonPath);
+        }
+        
+        JsonNode root = mapper.readTree(graphFile);
+        JsonNode nodes = root.get("nodes");
+        
+        if (nodes == null) {
+            throw new IllegalArgumentException("No 'nodes' field found");
+        }
+        
+        // Load Packages
+        JsonNode packages = nodes.get("packages");
+        if (packages != null && packages.isArray()) {
+            for (JsonNode pkg : packages) {
+                Map<String, Object> props = new HashMap<>();
+                props.put("simpleName", pkg.get("simpleName").asText());
+                addNode(pkg.get("qualifiedName").asText(), NodeType.PACKAGE, props);
+            }
+            System.out.println("  ✓ Loaded " + packages.size() + " packages");
+        }
+        
+        // Load Classes
+        JsonNode classes = nodes.get("classes");
+        if (classes != null && classes.isArray()) {
+            for (JsonNode cls : classes) {
+                Map<String, Object> props = new HashMap<>();
+                props.put("simpleName", cls.get("simpleName").asText());
+                props.put("packageName", cls.get("packageName").asText());
+                props.put("isInterface", cls.get("isInterface").asBoolean());
+                props.put("isAbstract", cls.get("isAbstract").asBoolean());
+                props.put("astDocId", cls.get("astDocId").asText());
+                
+                if (cls.has("sourceFile")) {
+                    props.put("sourceFile", cls.get("sourceFile").asText());
+                }
+                if (cls.has("lineStart")) {
+                    props.put("lineStart", cls.get("lineStart").asInt());
+                }
+                if (cls.has("lineEnd")) {
+                    props.put("lineEnd", cls.get("lineEnd").asInt());
+                }
+                
+                addNode(cls.get("id").asText(), NodeType.CLASS, props);
+            }
+            System.out.println("  ✓ Loaded " + classes.size() + " classes");
+        }
+        
+        // Load Methods
+        JsonNode methods = nodes.get("methods");
+        if (methods != null && methods.isArray()) {
+            for (JsonNode method : methods) {
+                if (method.has("isExternal") && method.get("isExternal").asBoolean()) {
+                    continue; // Skip external methods
+                }
+                
+                Map<String, Object> props = new HashMap<>();
+                props.put("simpleName", method.get("simpleName").asText());
+                props.put("className", method.get("className").asText());
+                props.put("packageName", method.get("packageName").asText());
+                props.put("returnType", method.has("returnType") ? 
+                         method.get("returnType").asText() : "void");
+                props.put("isPublic", method.get("isPublic").asBoolean());
+                props.put("isStatic", method.get("isStatic").asBoolean());
+                props.put("astDocId", method.get("astDocId").asText());
+                
+                if (method.has("lineStart")) {
+                    props.put("lineStart", method.get("lineStart").asInt());
+                }
+                if (method.has("lineEnd")) {
+                    props.put("lineEnd", method.get("lineEnd").asInt());
+                }
+                
+                // Code snippets
+                if (method.has("conditions")) {
+                    List<String> conditions = new ArrayList<>();
+                    method.get("conditions").forEach(c -> conditions.add(c.asText()));
+                    props.put("conditions", conditions);
+                }
+                
+                if (method.has("nullChecks")) {
+                    List<String> nullChecks = new ArrayList<>();
+                    method.get("nullChecks").forEach(nc -> nullChecks.add(nc.asText()));
+                    props.put("nullChecks", nullChecks);
+                }
+                
+                if (method.has("externalCalls")) {
+                    List<String> externalCalls = new ArrayList<>();
+                    method.get("externalCalls").forEach(ec -> externalCalls.add(ec.asText()));
+                    props.put("externalCalls", externalCalls);
+                }
+                
+                if (method.has("siblingCalls")) {
+                    List<String> siblingCalls = new ArrayList<>();
+                    method.get("siblingCalls").forEach(sc -> siblingCalls.add(sc.asText()));
+                    props.put("siblingCalls", siblingCalls);
+                }
+                
+                if (method.has("mockCandidates")) {
+                    List<String> mockCandidates = new ArrayList<>();
+                    method.get("mockCandidates").forEach(mc -> mockCandidates.add(mc.asText()));
+                    props.put("mockCandidates", mockCandidates);
+                }
+                
+                addNode(method.get("id").asText(), NodeType.METHOD, props);
+            }
+            System.out.println("  ✓ Loaded " + methods.size() + " methods");
+        }
+        
+        // Load Edges
+        JsonNode edges = root.get("edges");
+        if (edges != null && edges.isArray()) {
+            int edgeCount = 0;
+            for (JsonNode edge : edges) {
+                String fromId = edge.get("fromId").asText();
+                String toId = edge.get("toId").asText();
+                String type = edge.get("type").asText();
+                
+                Map<String, Object> props = new HashMap<>();
+                JsonNode edgeProps = edge.get("props");
+                if (edgeProps != null) {
+                    if (edgeProps.has("lineNumber")) {
+                        props.put("lineNumber", edgeProps.get("lineNumber").asInt());
+                    }
+                    if (edgeProps.has("callCount")) {
+                        props.put("callCount", edgeProps.get("callCount").asInt());
+                    }
+                }
+                
+                try {
+                    addEdge(fromId, toId, type, props);
+                    edgeCount++;
+                } catch (IllegalArgumentException e) {
+                    // Node might not exist (external method)
+                    if (type.equals("CALLS_EXTERNAL")) {
+                        // Create external method node
+                        Map<String, Object> extProps = new HashMap<>();
+                        extProps.put("simpleName", toId.split("#")[1]);
+                        extProps.put("className", toId.split("#")[0]);
+                        extProps.put("isExternal", true);
+                        addNode(toId, NodeType.METHOD, extProps);
+                        addEdge(fromId, toId, type, props);
+                        edgeCount++;
+                    }
+                }
+            }
+            System.out.println("  ✓ Loaded " + edgeCount + " edges");
+        }
+        
+        System.out.println("✅ Graph loaded successfully");
+    }
+    
+    /**
+     * Print graph statistics
+     */
+    public void printStats() {
+        System.out.println("\n📊 Graph Statistics:");
+        System.out.println("  Total Nodes: " + nodeMap.size());
+        System.out.println("  Total Edges: " + graph.edgeSet().size());
+        
+        long classCount = nodeMap.values().stream().filter(n -> n.type == NodeType.CLASS).count();
+        long methodCount = nodeMap.values().stream().filter(n -> n.type == NodeType.METHOD).count();
+        long packageCount = nodeMap.values().stream().filter(n -> n.type == NodeType.PACKAGE).count();
+        
+        System.out.println("    Classes: " + classCount);
+        System.out.println("    Methods: " + methodCount);
+        System.out.println("    Packages: " + packageCount);
+        
+        // Find methods with external calls
+        long methodsWithExternal = nodeMap.values().stream()
+            .filter(n -> n.type == NodeType.METHOD)
+            .filter(n -> {
+                List<String> calls = (List<String>) n.get("externalCalls");
+                return calls != null && !calls.isEmpty();
+            })
+            .count();
+        
+        System.out.println("  Methods with external calls: " + methodsWithExternal);
+        
+        // Find cycles
+        Set<GraphNode> cycles = detectCycles();
+        if (!cycles.isEmpty()) {
+            System.out.println("  ⚠️  Cycles detected: " + cycles.size() + " nodes involved");
+        } else {
+            System.out.println("  ✅ No cycles detected");
+        }
+    }
+    
+    /**
+     * Query: Find all methods that could be affected by changing a method
+     */
+    public Set<GraphNode> findAffectedMethods(String methodId) {
+        Set<GraphNode> affected = new HashSet<>();
+        GraphNode start = getNode(methodId);
+        if (start == null) return affected;
+        
+        // BFS traversal to find all callers (reverse graph)
+        Queue<GraphNode> queue = new LinkedList<>();
+        Set<GraphNode> visited = new HashSet<>();
+        queue.add(start);
+        visited.add(start);
+        
+        while (!queue.isEmpty()) {
+            GraphNode current = queue.poll();
+            for (GraphNode pred : getPredecessors(current.id)) {
+                if (pred.type == NodeType.METHOD && !visited.contains(pred)) {
+                    visited.add(pred);
+                    affected.add(pred);
+                    queue.add(pred);
+                }
+            }
+        }
+        
+        return affected;
+    }
+    
+    /**
+     * Generate test recommendations for uncovered methods
+     */
+    public String generateTestRecommendations(String methodId) {
+        GraphNode method = getNode(methodId);
+        if (method == null || method.type != NodeType.METHOD) {
+            return "Method not found";
+        }
+        
+        StringBuilder sb = new StringBuilder();
+        sb.append("Test Recommendations for: ").append(methodId).append("\n\n");
+        
+        // Get conditions
+        List<String> conditions = (List<String>) method.get("conditions");
+        if (conditions != null && !conditions.isEmpty()) {
+            sb.append("Paths to test:\n");
+            for (int i = 0; i < conditions.size(); i++) {
+                sb.append("  Path ").append(i + 1).append(": ").append(conditions.get(i)).append("\n");
+            }
+            sb.append("\n");
+        }
+        
+        // Get null checks
+        List<String> nullChecks = (List<String>) method.get("nullChecks");
+        if (nullChecks != null && !nullChecks.isEmpty()) {
+            sb.append("Null safety tests:\n");
+            for (String check : nullChecks) {
+                sb.append("  - Test with ").append(check).append("\n");
+            }
+            sb.append("\n");
+        }
+        
+        // Get external calls (need mocking)
+        List<String> externalCalls = (List<String>) method.get("externalCalls");
+        if (externalCalls != null && !externalCalls.isEmpty()) {
+            sb.append("Mocks needed:\n");
+            for (String call : externalCalls) {
+                sb.append("  - Mock: ").append(call).append("\n");
+            }
+            sb.append("\n");
+        }
+        
+        // Get sibling calls (may need spying)
+        List<String> siblingCalls = (List<String>) method.get("siblingCalls");
+        if (siblingCalls != null && !siblingCalls.isEmpty()) {
+            sb.append("Internal dependencies (consider spying):\n");
+            for (String call : siblingCalls) {
+                sb.append("  - ").append(call).append("\n");
+            }
+            sb.append("\n");
+        }
+        
+        return sb.toString();
+    }
+    
+    /**
+     * Main method - Load graph from file
+     */
+    public static void main(String[] args) {
+        String graphJsonPath = args.length > 0 ? args[0] : 
+            "C:/Users/PrabalBhardwaj/Desktop/osttra-harmony3/dependency_graph.json";
+        
+        System.out.println("╔══════════════════════════════════════════════════════════╗");
+        System.out.println("║     In-Memory Graph Storage - Harmony Codebase          ║");
+        System.out.println("╚══════════════════════════════════════════════════════════╝");
+        
+        InMemoryGraphStorage storage = new InMemoryGraphStorage();
+        
+        try {
+            // Load graph from file
+            storage.loadFromFile(graphJsonPath);
+            
+            // Print statistics
+            storage.printStats();
+            
+            // Example queries
+            System.out.println("\n🔍 Example Queries:");
+            
+            // Find methods with external calls
+            List<GraphNode> methodsWithExternal = storage.findMethodsWithExternalCalls();
+            if (!methodsWithExternal.isEmpty()) {
+                System.out.println("\n  Methods with external calls:");
+                methodsWithExternal.stream().limit(5).forEach(m -> {
+                    List<String> calls = (List<String>) m.get("externalCalls");
+                    System.out.println("    " + m.id + " → " + calls.size() + " external calls");
+                });
+            }
+            
+            // Get most called methods
+            Map<String, Integer> callCounts = storage.getMethodCallCounts();
+            if (!callCounts.isEmpty()) {
+                System.out.println("\n  Most called methods:");
+                callCounts.entrySet().stream()
+                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                    .limit(5)
+                    .forEach(entry -> System.out.println("    " + entry.getKey() + " (" + entry.getValue() + " calls)"));
+            }
+            
+            // Check for cycles
+            Set<GraphNode> cycles = storage.detectCycles();
+            if (!cycles.isEmpty()) {
+                System.out.println("\n  ⚠️  Cycles detected in call graph!");
+                cycles.stream().limit(5).forEach(n -> System.out.println("    " + n.id));
+            }
+            
+            // Generate test recommendations for a sample method
+            if (!methodsWithExternal.isEmpty()) {
+                System.out.println("\n📝 Test Recommendations for: " + methodsWithExternal.get(0).id);
+                System.out.println(storage.generateTestRecommendations(methodsWithExternal.get(0).id));
+            }
+            
+        } catch (Exception e) {
+            System.err.println("❌ Error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+}

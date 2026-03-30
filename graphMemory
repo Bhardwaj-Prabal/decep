@@ -1,10 +1,5 @@
-import org.jgrapht.Graph;
-import org.jgrapht.graph.DefaultDirectedGraph;
-import org.jgrapht.graph.DefaultEdge;
-import org.jgrapht.graph.AsSubgraph;
-import org.jgrapht.traverse.BreadthFirstIterator;
-import org.jgrapht.alg.shortestpath.DijkstraShortestPath;
-import org.jgrapht.alg.cycle.CycleDetector;
+package org.example.db;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -20,8 +15,9 @@ import java.util.concurrent.ConcurrentHashMap;
 public class InMemoryGraphStorage {
     
     // Graph with custom edges that can store properties
-    private final Graph<GraphNode, GraphEdge> graph;
     private final Map<String, GraphNode> nodeMap;
+    private final Map<String, List<GraphEdge>> outgoingEdges;
+    private final Map<String, List<GraphEdge>> incomingEdges;
     private final ObjectMapper mapper;
     
     // Node types
@@ -47,7 +43,12 @@ public class InMemoryGraphStorage {
             properties.put(key, value);
         }
         
-        public Object get(String key) {
+        @SuppressWarnings("unchecked")
+        public <T> T get(String key) {
+            return (T) properties.get(key);
+        }
+        
+        public Object getObject(String key) {
             return properties.get(key);
         }
         
@@ -73,14 +74,22 @@ public class InMemoryGraphStorage {
     /**
      * Graph Edge with properties
      */
-    public static class GraphEdge extends DefaultEdge {
-        private final Map<String, Object> properties;
+    public static class GraphEdge {
+        private final String from;
+        private final String to;
         private final String type;
+        private final Map<String, Object> properties;
         
-        public GraphEdge(String type) {
+        public GraphEdge(String from, String to, String type) {
+            this.from = from;
+            this.to = to;
             this.type = type;
             this.properties = new ConcurrentHashMap<>();
         }
+        
+        public String getFrom() { return from; }
+        public String getTo() { return to; }
+        public String getType() { return type; }
         
         public void put(String key, Object value) {
             properties.put(key, value);
@@ -90,17 +99,13 @@ public class InMemoryGraphStorage {
             return properties.get(key);
         }
         
-        public String getType() {
-            return type;
-        }
-        
         public Map<String, Object> getProperties() {
             return properties;
         }
         
         @Override
         public String toString() {
-            return type + (properties.isEmpty() ? "" : " " + properties);
+            return from + " -[" + type + "]-> " + to + (properties.isEmpty() ? "" : " " + properties);
         }
     }
     
@@ -108,8 +113,9 @@ public class InMemoryGraphStorage {
      * Constructor - Initialize empty graph
      */
     public InMemoryGraphStorage() {
-        this.graph = new DefaultDirectedGraph<>(GraphEdge.class);
         this.nodeMap = new ConcurrentHashMap<>();
+        this.outgoingEdges = new ConcurrentHashMap<>();
+        this.incomingEdges = new ConcurrentHashMap<>();
         this.mapper = new ObjectMapper();
     }
     
@@ -125,7 +131,6 @@ public class InMemoryGraphStorage {
      */
     public GraphNode addNode(String id, NodeType type, Map<String, Object> properties) {
         GraphNode node = nodeMap.computeIfAbsent(id, k -> new GraphNode(k, type));
-        graph.addVertex(node);
         if (properties != null) {
             node.properties.putAll(properties);
         }
@@ -137,6 +142,20 @@ public class InMemoryGraphStorage {
      */
     public GraphNode getNode(String id) {
         return nodeMap.get(id);
+    }
+    
+    /**
+     * Check if node exists
+     */
+    public boolean hasNode(String id) {
+        return nodeMap.containsKey(id);
+    }
+    
+    /**
+     * Get all nodes
+     */
+    public Collection<GraphNode> getAllNodes() {
+        return nodeMap.values();
     }
     
     /**
@@ -154,149 +173,147 @@ public class InMemoryGraphStorage {
         GraphNode to = getNode(toId);
         
         if (from == null) {
-            throw new IllegalArgumentException("Source node not found: " + fromId);
+            // Auto-create node if it doesn't exist (for external methods)
+            from = addNode(fromId, detectNodeType(fromId));
         }
         if (to == null) {
-            throw new IllegalArgumentException("Target node not found: " + toId);
+            to = addNode(toId, detectNodeType(toId));
         }
         
-        GraphEdge edge = new GraphEdge(edgeType);
+        GraphEdge edge = new GraphEdge(fromId, toId, edgeType);
         if (properties != null) {
             edge.properties.putAll(properties);
         }
         
-        graph.addEdge(from, to, edge);
+        outgoingEdges.computeIfAbsent(fromId, k -> new ArrayList<>()).add(edge);
+        incomingEdges.computeIfAbsent(toId, k -> new ArrayList<>()).add(edge);
+        
         return edge;
+    }
+    
+    /**
+     * Detect node type from ID pattern
+     */
+    private NodeType detectNodeType(String id) {
+        if (id.contains("#")) {
+            return NodeType.METHOD;
+        } else if (id.contains(".")) {
+            return NodeType.CLASS;
+        } else {
+            return NodeType.PACKAGE;
+        }
     }
     
     /**
      * Get all edges from a node
      */
-    public Set<GraphEdge> getOutgoingEdges(String nodeId) {
-        GraphNode node = getNode(nodeId);
-        if (node == null) return Collections.emptySet();
-        return graph.outgoingEdgesOf(node);
+    public List<GraphEdge> getOutgoingEdges(String nodeId) {
+        return outgoingEdges.getOrDefault(nodeId, Collections.emptyList());
     }
     
     /**
      * Get all edges to a node
      */
-    public Set<GraphEdge> getIncomingEdges(String nodeId) {
-        GraphNode node = getNode(nodeId);
-        if (node == null) return Collections.emptySet();
-        return graph.incomingEdgesOf(node);
+    public List<GraphEdge> getIncomingEdges(String nodeId) {
+        return incomingEdges.getOrDefault(nodeId, Collections.emptyList());
     }
     
     /**
      * Get all successors (nodes this node points to)
      */
-    public Set<GraphNode> getSuccessors(String nodeId) {
-        GraphNode node = getNode(nodeId);
-        if (node == null) return Collections.emptySet();
-        return graph.outgoingEdgesOf(node).stream()
-            .map(graph::getEdgeTarget)
-            .collect(java.util.stream.Collectors.toSet());
+    public Set<String> getSuccessors(String nodeId) {
+        Set<String> successors = new HashSet<>();
+        for (GraphEdge edge : getOutgoingEdges(nodeId)) {
+            successors.add(edge.getTo());
+        }
+        return successors;
     }
     
     /**
      * Get all predecessors (nodes that point to this node)
      */
-    public Set<GraphNode> getPredecessors(String nodeId) {
-        GraphNode node = getNode(nodeId);
-        if (node == null) return Collections.emptySet();
-        return graph.incomingEdgesOf(node).stream()
-            .map(graph::getEdgeSource)
-            .collect(java.util.stream.Collectors.toSet());
+    public Set<String> getPredecessors(String nodeId) {
+        Set<String> predecessors = new HashSet<>();
+        for (GraphEdge edge : getIncomingEdges(nodeId)) {
+            predecessors.add(edge.getFrom());
+        }
+        return predecessors;
     }
     
     /**
      * Find all callers of a method (reverse call graph)
      */
-    public List<GraphNode> getCallers(String methodId) {
-        return getPredecessors(methodId).stream()
-            .filter(node -> node.type == NodeType.METHOD)
-            .collect(java.util.stream.Collectors.toList());
+    public List<String> getCallers(String methodId) {
+        List<String> callers = new ArrayList<>();
+        for (GraphEdge edge : getIncomingEdges(methodId)) {
+            if (edge.getType().equals("CALLS") || edge.getType().equals("CALLS_EXTERNAL")) {
+                callers.add(edge.getFrom());
+            }
+        }
+        return callers;
     }
     
     /**
      * Find all callees of a method (forward call graph)
      */
-    public List<GraphNode> getCallees(String methodId) {
-        return getSuccessors(methodId).stream()
-            .filter(node -> node.type == NodeType.METHOD)
-            .collect(java.util.stream.Collectors.toList());
+    public List<String> getCallees(String methodId) {
+        List<String> callees = new ArrayList<>();
+        for (GraphEdge edge : getOutgoingEdges(methodId)) {
+            if (edge.getType().equals("CALLS") || edge.getType().equals("CALLS_EXTERNAL")) {
+                callees.add(edge.getTo());
+            }
+        }
+        return callees;
     }
     
     /**
      * Find all methods in a class
      */
     public List<GraphNode> getMethodsInClass(String className) {
-        GraphNode classNode = getNode(className);
-        if (classNode == null || classNode.type != NodeType.CLASS) {
-            return Collections.emptyList();
+        List<GraphNode> methods = new ArrayList<>();
+        for (GraphNode node : nodeMap.values()) {
+            if (node.type == NodeType.METHOD) {
+                String nodeClassName = node.get("className");
+                if (className.equals(nodeClassName)) {
+                    methods.add(node);
+                }
+            }
         }
-        
-        return getSuccessors(className).stream()
-            .filter(node -> node.type == NodeType.METHOD)
-            .filter(node -> {
-                String nodeClassName = (String) node.get("className");
-                return className.equals(nodeClassName);
-            })
-            .collect(java.util.stream.Collectors.toList());
+        return methods;
     }
     
     /**
      * Find methods that call external services
      */
     public List<GraphNode> findMethodsWithExternalCalls() {
-        return nodeMap.values().stream()
-            .filter(node -> node.type == NodeType.METHOD)
-            .filter(node -> {
-                List<String> externalCalls = (List<String>) node.get("externalCalls");
-                return externalCalls != null && !externalCalls.isEmpty();
-            })
-            .collect(java.util.stream.Collectors.toList());
+        List<GraphNode> result = new ArrayList<>();
+        for (GraphNode node : nodeMap.values()) {
+            if (node.type == NodeType.METHOD) {
+                List<String> externalCalls = node.get("externalCalls");
+                if (externalCalls != null && !externalCalls.isEmpty()) {
+                    result.add(node);
+                }
+            }
+        }
+        return result;
     }
     
     /**
-     * Find methods that need mocking (have external calls or sibling calls)
+     * Find methods that need mocking
      */
     public List<GraphNode> findMethodsNeedingMocks() {
-        return nodeMap.values().stream()
-            .filter(node -> node.type == NodeType.METHOD)
-            .filter(node -> {
-                List<String> externalCalls = (List<String>) node.get("externalCalls");
-                List<String> siblingCalls = (List<String>) node.get("siblingCalls");
-                return (externalCalls != null && !externalCalls.isEmpty()) ||
-                       (siblingCalls != null && !siblingCalls.isEmpty());
-            })
-            .collect(java.util.stream.Collectors.toList());
-    }
-    
-    /**
-     * Find paths between two methods (for impact analysis)
-     */
-    public List<List<GraphNode>> findPaths(String fromMethodId, String toMethodId) {
-        GraphNode from = getNode(fromMethodId);
-        GraphNode to = getNode(toMethodId);
-        
-        if (from == null || to == null) {
-            return Collections.emptyList();
+        List<GraphNode> result = new ArrayList<>();
+        for (GraphNode node : nodeMap.values()) {
+            if (node.type == NodeType.METHOD) {
+                List<String> externalCalls = node.get("externalCalls");
+                List<String> siblingCalls = node.get("siblingCalls");
+                if ((externalCalls != null && !externalCalls.isEmpty()) ||
+                    (siblingCalls != null && !siblingCalls.isEmpty())) {
+                    result.add(node);
+                }
+            }
         }
-        
-        DijkstraShortestPath<GraphNode, GraphEdge> dijkstra = 
-            new DijkstraShortestPath<>(graph);
-        
-        List<GraphNode> path = dijkstra.getPath(from, to).getVertexList();
-        return path.isEmpty() ? Collections.emptyList() : Collections.singletonList(path);
-    }
-    
-    /**
-     * Detect cycles in the call graph
-     */
-    public Set<GraphNode> detectCycles() {
-        CycleDetector<GraphNode, GraphEdge> detector = new CycleDetector<>(graph);
-        return detector.findCycles();
+        return result;
     }
     
     /**
@@ -304,19 +321,60 @@ public class InMemoryGraphStorage {
      */
     public Map<String, Integer> getMethodCallCounts() {
         Map<String, Integer> callCounts = new HashMap<>();
-        
-        for (GraphEdge edge : graph.edgeSet()) {
-            GraphNode target = graph.getEdgeTarget(edge);
-            if (target.type == NodeType.METHOD) {
-                callCounts.merge(target.id, 1, Integer::sum);
+        for (GraphEdge edge : getAllEdges()) {
+            if (edge.getType().equals("CALLS") || edge.getType().equals("CALLS_EXTERNAL")) {
+                callCounts.merge(edge.getTo(), 1, Integer::sum);
             }
         }
-        
         return callCounts;
     }
     
     /**
-     * Export graph to JSON (for debugging/saving)
+     * Get all edges
+     */
+    public List<GraphEdge> getAllEdges() {
+        List<GraphEdge> allEdges = new ArrayList<>();
+        for (List<GraphEdge> edges : outgoingEdges.values()) {
+            allEdges.addAll(edges);
+        }
+        return allEdges;
+    }
+    
+    /**
+     * Detect cycles in the call graph
+     */
+    public Set<String> detectCycles() {
+        Set<String> cycles = new HashSet<>();
+        Set<String> visited = new HashSet<>();
+        Set<String> recursionStack = new HashSet<>();
+        
+        for (String nodeId : nodeMap.keySet()) {
+            if (!visited.contains(nodeId)) {
+                detectCyclesDFS(nodeId, visited, recursionStack, cycles);
+            }
+        }
+        return cycles;
+    }
+    
+    private void detectCyclesDFS(String nodeId, Set<String> visited, 
+                                  Set<String> recursionStack, Set<String> cycles) {
+        visited.add(nodeId);
+        recursionStack.add(nodeId);
+        
+        for (String successor : getSuccessors(nodeId)) {
+            if (!visited.contains(successor)) {
+                detectCyclesDFS(successor, visited, recursionStack, cycles);
+            } else if (recursionStack.contains(successor)) {
+                cycles.add(nodeId);
+                cycles.add(successor);
+            }
+        }
+        
+        recursionStack.remove(nodeId);
+    }
+    
+    /**
+     * Export graph to JSON (for debugging)
      */
     public ObjectNode exportToJson() {
         ObjectNode root = mapper.createObjectNode();
@@ -332,12 +390,10 @@ public class InMemoryGraphStorage {
         
         // Export edges
         int edgeIndex = 0;
-        for (GraphEdge edge : graph.edgeSet()) {
-            GraphNode source = graph.getEdgeSource(edge);
-            GraphNode target = graph.getEdgeTarget(edge);
+        for (GraphEdge edge : getAllEdges()) {
             ObjectNode edgeJson = edges.putObject("edge_" + edgeIndex++);
-            edgeJson.put("from", source.id);
-            edgeJson.put("to", target.id);
+            edgeJson.put("from", edge.getFrom());
+            edgeJson.put("to", edge.getTo());
             edgeJson.put("type", edge.getType());
             edgeJson.putPOJO("properties", edge.getProperties());
         }
@@ -403,9 +459,12 @@ public class InMemoryGraphStorage {
         // Load Methods
         JsonNode methods = nodes.get("methods");
         if (methods != null && methods.isArray()) {
+            int loaded = 0;
+            int skipped = 0;
             for (JsonNode method : methods) {
                 if (method.has("isExternal") && method.get("isExternal").asBoolean()) {
-                    continue; // Skip external methods
+                    skipped++;
+                    continue;
                 }
                 
                 Map<String, Object> props = new HashMap<>();
@@ -426,39 +485,40 @@ public class InMemoryGraphStorage {
                 }
                 
                 // Code snippets
-                if (method.has("conditions")) {
+                if (method.has("conditions") && method.get("conditions").isArray()) {
                     List<String> conditions = new ArrayList<>();
                     method.get("conditions").forEach(c -> conditions.add(c.asText()));
                     props.put("conditions", conditions);
                 }
                 
-                if (method.has("nullChecks")) {
+                if (method.has("nullChecks") && method.get("nullChecks").isArray()) {
                     List<String> nullChecks = new ArrayList<>();
                     method.get("nullChecks").forEach(nc -> nullChecks.add(nc.asText()));
                     props.put("nullChecks", nullChecks);
                 }
                 
-                if (method.has("externalCalls")) {
+                if (method.has("externalCalls") && method.get("externalCalls").isArray()) {
                     List<String> externalCalls = new ArrayList<>();
                     method.get("externalCalls").forEach(ec -> externalCalls.add(ec.asText()));
                     props.put("externalCalls", externalCalls);
                 }
                 
-                if (method.has("siblingCalls")) {
+                if (method.has("siblingCalls") && method.get("siblingCalls").isArray()) {
                     List<String> siblingCalls = new ArrayList<>();
                     method.get("siblingCalls").forEach(sc -> siblingCalls.add(sc.asText()));
                     props.put("siblingCalls", siblingCalls);
                 }
                 
-                if (method.has("mockCandidates")) {
+                if (method.has("mockCandidates") && method.get("mockCandidates").isArray()) {
                     List<String> mockCandidates = new ArrayList<>();
                     method.get("mockCandidates").forEach(mc -> mockCandidates.add(mc.asText()));
                     props.put("mockCandidates", mockCandidates);
                 }
                 
                 addNode(method.get("id").asText(), NodeType.METHOD, props);
+                loaded++;
             }
-            System.out.println("  ✓ Loaded " + methods.size() + " methods");
+            System.out.println("  ✓ Loaded " + loaded + " methods (" + skipped + " external skipped)");
         }
         
         // Load Edges
@@ -481,22 +541,8 @@ public class InMemoryGraphStorage {
                     }
                 }
                 
-                try {
-                    addEdge(fromId, toId, type, props);
-                    edgeCount++;
-                } catch (IllegalArgumentException e) {
-                    // Node might not exist (external method)
-                    if (type.equals("CALLS_EXTERNAL")) {
-                        // Create external method node
-                        Map<String, Object> extProps = new HashMap<>();
-                        extProps.put("simpleName", toId.split("#")[1]);
-                        extProps.put("className", toId.split("#")[0]);
-                        extProps.put("isExternal", true);
-                        addNode(toId, NodeType.METHOD, extProps);
-                        addEdge(fromId, toId, type, props);
-                        edgeCount++;
-                    }
-                }
+                addEdge(fromId, toId, type, props);
+                edgeCount++;
             }
             System.out.println("  ✓ Loaded " + edgeCount + " edges");
         }
@@ -510,7 +556,7 @@ public class InMemoryGraphStorage {
     public void printStats() {
         System.out.println("\n📊 Graph Statistics:");
         System.out.println("  Total Nodes: " + nodeMap.size());
-        System.out.println("  Total Edges: " + graph.edgeSet().size());
+        System.out.println("  Total Edges: " + getAllEdges().size());
         
         long classCount = nodeMap.values().stream().filter(n -> n.type == NodeType.CLASS).count();
         long methodCount = nodeMap.values().stream().filter(n -> n.type == NodeType.METHOD).count();
@@ -524,7 +570,7 @@ public class InMemoryGraphStorage {
         long methodsWithExternal = nodeMap.values().stream()
             .filter(n -> n.type == NodeType.METHOD)
             .filter(n -> {
-                List<String> calls = (List<String>) n.get("externalCalls");
+                List<String> calls = n.get("externalCalls");
                 return calls != null && !calls.isEmpty();
             })
             .count();
@@ -532,7 +578,7 @@ public class InMemoryGraphStorage {
         System.out.println("  Methods with external calls: " + methodsWithExternal);
         
         // Find cycles
-        Set<GraphNode> cycles = detectCycles();
+        Set<String> cycles = detectCycles();
         if (!cycles.isEmpty()) {
             System.out.println("  ⚠️  Cycles detected: " + cycles.size() + " nodes involved");
         } else {
@@ -541,47 +587,19 @@ public class InMemoryGraphStorage {
     }
     
     /**
-     * Query: Find all methods that could be affected by changing a method
-     */
-    public Set<GraphNode> findAffectedMethods(String methodId) {
-        Set<GraphNode> affected = new HashSet<>();
-        GraphNode start = getNode(methodId);
-        if (start == null) return affected;
-        
-        // BFS traversal to find all callers (reverse graph)
-        Queue<GraphNode> queue = new LinkedList<>();
-        Set<GraphNode> visited = new HashSet<>();
-        queue.add(start);
-        visited.add(start);
-        
-        while (!queue.isEmpty()) {
-            GraphNode current = queue.poll();
-            for (GraphNode pred : getPredecessors(current.id)) {
-                if (pred.type == NodeType.METHOD && !visited.contains(pred)) {
-                    visited.add(pred);
-                    affected.add(pred);
-                    queue.add(pred);
-                }
-            }
-        }
-        
-        return affected;
-    }
-    
-    /**
      * Generate test recommendations for uncovered methods
      */
     public String generateTestRecommendations(String methodId) {
         GraphNode method = getNode(methodId);
         if (method == null || method.type != NodeType.METHOD) {
-            return "Method not found";
+            return "Method not found: " + methodId;
         }
         
         StringBuilder sb = new StringBuilder();
         sb.append("Test Recommendations for: ").append(methodId).append("\n\n");
         
         // Get conditions
-        List<String> conditions = (List<String>) method.get("conditions");
+        List<String> conditions = method.get("conditions");
         if (conditions != null && !conditions.isEmpty()) {
             sb.append("Paths to test:\n");
             for (int i = 0; i < conditions.size(); i++) {
@@ -591,7 +609,7 @@ public class InMemoryGraphStorage {
         }
         
         // Get null checks
-        List<String> nullChecks = (List<String>) method.get("nullChecks");
+        List<String> nullChecks = method.get("nullChecks");
         if (nullChecks != null && !nullChecks.isEmpty()) {
             sb.append("Null safety tests:\n");
             for (String check : nullChecks) {
@@ -601,7 +619,7 @@ public class InMemoryGraphStorage {
         }
         
         // Get external calls (need mocking)
-        List<String> externalCalls = (List<String>) method.get("externalCalls");
+        List<String> externalCalls = method.get("externalCalls");
         if (externalCalls != null && !externalCalls.isEmpty()) {
             sb.append("Mocks needed:\n");
             for (String call : externalCalls) {
@@ -611,11 +629,21 @@ public class InMemoryGraphStorage {
         }
         
         // Get sibling calls (may need spying)
-        List<String> siblingCalls = (List<String>) method.get("siblingCalls");
+        List<String> siblingCalls = method.get("siblingCalls");
         if (siblingCalls != null && !siblingCalls.isEmpty()) {
             sb.append("Internal dependencies (consider spying):\n");
             for (String call : siblingCalls) {
                 sb.append("  - ").append(call).append("\n");
+            }
+            sb.append("\n");
+        }
+        
+        // Get callers (impact analysis)
+        List<String> callers = getCallers(methodId);
+        if (!callers.isEmpty()) {
+            sb.append("This method is called by:\n");
+            for (String caller : callers) {
+                sb.append("  - ").append(caller).append("\n");
             }
             sb.append("\n");
         }
@@ -651,7 +679,7 @@ public class InMemoryGraphStorage {
             if (!methodsWithExternal.isEmpty()) {
                 System.out.println("\n  Methods with external calls:");
                 methodsWithExternal.stream().limit(5).forEach(m -> {
-                    List<String> calls = (List<String>) m.get("externalCalls");
+                    List<String> calls = m.get("externalCalls");
                     System.out.println("    " + m.id + " → " + calls.size() + " external calls");
                 });
             }
@@ -667,10 +695,10 @@ public class InMemoryGraphStorage {
             }
             
             // Check for cycles
-            Set<GraphNode> cycles = storage.detectCycles();
+            Set<String> cycles = storage.detectCycles();
             if (!cycles.isEmpty()) {
                 System.out.println("\n  ⚠️  Cycles detected in call graph!");
-                cycles.stream().limit(5).forEach(n -> System.out.println("    " + n.id));
+                cycles.stream().limit(10).forEach(n -> System.out.println("    " + n));
             }
             
             // Generate test recommendations for a sample method

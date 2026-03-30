@@ -1,4 +1,4 @@
-package org.example.db;
+package org.example.dbUploader;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -7,27 +7,23 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.File;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * In-Memory Graph Storage using JGraphT
- * Stores dependency graph in memory for fast queries
+ * In-Memory Graph Storage - Optimized for Large Graphs
+ * Uses iterative algorithms to avoid StackOverflowError
  */
 public class InMemoryGraphStorage {
     
-    // Graph with custom edges that can store properties
     private final Map<String, GraphNode> nodeMap;
     private final Map<String, List<GraphEdge>> outgoingEdges;
     private final Map<String, List<GraphEdge>> incomingEdges;
     private final ObjectMapper mapper;
     
-    // Node types
     public enum NodeType {
         METHOD, CLASS, PACKAGE
     }
     
-    /**
-     * Graph Node with metadata
-     */
     public static class GraphNode {
         public final String id;
         public final NodeType type;
@@ -39,41 +35,16 @@ public class InMemoryGraphStorage {
             this.properties = new ConcurrentHashMap<>();
         }
         
-        public void put(String key, Object value) {
-            properties.put(key, value);
-        }
-        
         @SuppressWarnings("unchecked")
         public <T> T get(String key) {
             return (T) properties.get(key);
         }
         
-        public Object getObject(String key) {
-            return properties.get(key);
-        }
-        
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-            GraphNode node = (GraphNode) o;
-            return Objects.equals(id, node.id);
-        }
-        
-        @Override
-        public int hashCode() {
-            return Objects.hash(id);
-        }
-        
-        @Override
-        public String toString() {
-            return id + " (" + type + ")";
+        public void put(String key, Object value) {
+            properties.put(key, value);
         }
     }
     
-    /**
-     * Graph Edge with properties
-     */
     public static class GraphEdge {
         private final String from;
         private final String to;
@@ -90,28 +61,10 @@ public class InMemoryGraphStorage {
         public String getFrom() { return from; }
         public String getTo() { return to; }
         public String getType() { return type; }
-        
-        public void put(String key, Object value) {
-            properties.put(key, value);
-        }
-        
-        public Object get(String key) {
-            return properties.get(key);
-        }
-        
-        public Map<String, Object> getProperties() {
-            return properties;
-        }
-        
-        @Override
-        public String toString() {
-            return from + " -[" + type + "]-> " + to + (properties.isEmpty() ? "" : " " + properties);
-        }
+        public Map<String, Object> getProperties() { return properties; }
+        public void put(String key, Object value) { properties.put(key, value); }
     }
     
-    /**
-     * Constructor - Initialize empty graph
-     */
     public InMemoryGraphStorage() {
         this.nodeMap = new ConcurrentHashMap<>();
         this.outgoingEdges = new ConcurrentHashMap<>();
@@ -119,16 +72,10 @@ public class InMemoryGraphStorage {
         this.mapper = new ObjectMapper();
     }
     
-    /**
-     * Add a node to the graph
-     */
     public GraphNode addNode(String id, NodeType type) {
         return addNode(id, type, null);
     }
     
-    /**
-     * Add a node with properties
-     */
     public GraphNode addNode(String id, NodeType type, Map<String, Object> properties) {
         GraphNode node = nodeMap.computeIfAbsent(id, k -> new GraphNode(k, type));
         if (properties != null) {
@@ -137,47 +84,24 @@ public class InMemoryGraphStorage {
         return node;
     }
     
-    /**
-     * Get a node by ID
-     */
     public GraphNode getNode(String id) {
         return nodeMap.get(id);
     }
     
-    /**
-     * Check if node exists
-     */
-    public boolean hasNode(String id) {
-        return nodeMap.containsKey(id);
-    }
-    
-    /**
-     * Get all nodes
-     */
     public Collection<GraphNode> getAllNodes() {
         return nodeMap.values();
     }
     
-    /**
-     * Add an edge between two nodes
-     */
     public GraphEdge addEdge(String fromId, String toId, String edgeType) {
         return addEdge(fromId, toId, edgeType, null);
     }
     
-    /**
-     * Add an edge with properties
-     */
     public GraphEdge addEdge(String fromId, String toId, String edgeType, Map<String, Object> properties) {
-        GraphNode from = getNode(fromId);
-        GraphNode to = getNode(toId);
-        
-        if (from == null) {
-            // Auto-create node if it doesn't exist (for external methods)
-            from = addNode(fromId, detectNodeType(fromId));
+        if (!nodeMap.containsKey(fromId)) {
+            addNode(fromId, detectNodeType(fromId));
         }
-        if (to == null) {
-            to = addNode(toId, detectNodeType(toId));
+        if (!nodeMap.containsKey(toId)) {
+            addNode(toId, detectNodeType(toId));
         }
         
         GraphEdge edge = new GraphEdge(fromId, toId, edgeType);
@@ -191,36 +115,20 @@ public class InMemoryGraphStorage {
         return edge;
     }
     
-    /**
-     * Detect node type from ID pattern
-     */
     private NodeType detectNodeType(String id) {
-        if (id.contains("#")) {
-            return NodeType.METHOD;
-        } else if (id.contains(".")) {
-            return NodeType.CLASS;
-        } else {
-            return NodeType.PACKAGE;
-        }
+        if (id.contains("#")) return NodeType.METHOD;
+        else if (id.contains(".")) return NodeType.CLASS;
+        else return NodeType.PACKAGE;
     }
     
-    /**
-     * Get all edges from a node
-     */
     public List<GraphEdge> getOutgoingEdges(String nodeId) {
         return outgoingEdges.getOrDefault(nodeId, Collections.emptyList());
     }
     
-    /**
-     * Get all edges to a node
-     */
     public List<GraphEdge> getIncomingEdges(String nodeId) {
         return incomingEdges.getOrDefault(nodeId, Collections.emptyList());
     }
     
-    /**
-     * Get all successors (nodes this node points to)
-     */
     public Set<String> getSuccessors(String nodeId) {
         Set<String> successors = new HashSet<>();
         for (GraphEdge edge : getOutgoingEdges(nodeId)) {
@@ -229,9 +137,6 @@ public class InMemoryGraphStorage {
         return successors;
     }
     
-    /**
-     * Get all predecessors (nodes that point to this node)
-     */
     public Set<String> getPredecessors(String nodeId) {
         Set<String> predecessors = new HashSet<>();
         for (GraphEdge edge : getIncomingEdges(nodeId)) {
@@ -240,9 +145,6 @@ public class InMemoryGraphStorage {
         return predecessors;
     }
     
-    /**
-     * Find all callers of a method (reverse call graph)
-     */
     public List<String> getCallers(String methodId) {
         List<String> callers = new ArrayList<>();
         for (GraphEdge edge : getIncomingEdges(methodId)) {
@@ -253,9 +155,6 @@ public class InMemoryGraphStorage {
         return callers;
     }
     
-    /**
-     * Find all callees of a method (forward call graph)
-     */
     public List<String> getCallees(String methodId) {
         List<String> callees = new ArrayList<>();
         for (GraphEdge edge : getOutgoingEdges(methodId)) {
@@ -267,23 +166,77 @@ public class InMemoryGraphStorage {
     }
     
     /**
-     * Find all methods in a class
+     * ITERATIVE cycle detection - NO recursion to avoid StackOverflowError
      */
-    public List<GraphNode> getMethodsInClass(String className) {
-        List<GraphNode> methods = new ArrayList<>();
+    public Set<String> detectCycles() {
+        System.out.println("\n🔍 Detecting cycles (iterative)...");
+        Set<String> cycleNodes = new HashSet<>();
+        Set<String> visited = new HashSet<>();
+        
+        int processed = 0;
+        int totalNodes = nodeMap.size();
+        
+        // Only check METHOD nodes (classes and packages don't participate in call cycles)
+        List<String> methodNodes = new ArrayList<>();
         for (GraphNode node : nodeMap.values()) {
             if (node.type == NodeType.METHOD) {
-                String nodeClassName = node.get("className");
-                if (className.equals(nodeClassName)) {
-                    methods.add(node);
-                }
+                methodNodes.add(node.id);
             }
         }
-        return methods;
+        
+        System.out.println("  Checking " + methodNodes.size() + " method nodes for cycles...");
+        
+        for (String startNode : methodNodes) {
+            if (visited.contains(startNode)) continue;
+            
+            // Iterative DFS using explicit stack
+            Set<String> currentPath = new HashSet<>();
+            Deque<Iterator<String>> stack = new ArrayDeque<>();
+            Deque<String> nodeStack = new ArrayDeque<>();
+            
+            nodeStack.push(startNode);
+            currentPath.add(startNode);
+            stack.push(getSuccessors(startNode).iterator());
+            
+            while (!stack.isEmpty()) {
+                Iterator<String> it = stack.peek();
+                
+                if (!it.hasNext()) {
+                    // Backtrack
+                    stack.pop();
+                    String popped = nodeStack.pop();
+                    currentPath.remove(popped);
+                    visited.add(popped);
+                    continue;
+                }
+                
+                String next = it.next();
+                
+                if (currentPath.contains(next)) {
+                    // Cycle detected!
+                    cycleNodes.add(next);
+                    cycleNodes.addAll(currentPath);
+                }
+                
+                if (!visited.contains(next)) {
+                    nodeStack.push(next);
+                    currentPath.add(next);
+                    stack.push(getSuccessors(next).iterator());
+                }
+            }
+            
+            processed++;
+            if (processed % 10000 == 0) {
+                System.out.print(".");
+            }
+        }
+        
+        System.out.println("\n  ✅ Cycle detection complete");
+        return cycleNodes;
     }
     
     /**
-     * Find methods that call external services
+     * Find methods with external calls (calls to Java, Spring, etc.)
      */
     public List<GraphNode> findMethodsWithExternalCalls() {
         List<GraphNode> result = new ArrayList<>();
@@ -317,7 +270,7 @@ public class InMemoryGraphStorage {
     }
     
     /**
-     * Get all methods with their call counts (popularity)
+     * Get method call counts (popularity)
      */
     public Map<String, Integer> getMethodCallCounts() {
         Map<String, Integer> callCounts = new HashMap<>();
@@ -341,68 +294,28 @@ public class InMemoryGraphStorage {
     }
     
     /**
-     * Detect cycles in the call graph
+     * Find methods by line range (for JaCoCo integration)
      */
-    public Set<String> detectCycles() {
-        Set<String> cycles = new HashSet<>();
-        Set<String> visited = new HashSet<>();
-        Set<String> recursionStack = new HashSet<>();
-        
-        for (String nodeId : nodeMap.keySet()) {
-            if (!visited.contains(nodeId)) {
-                detectCyclesDFS(nodeId, visited, recursionStack, cycles);
-            }
-        }
-        return cycles;
-    }
-    
-    private void detectCyclesDFS(String nodeId, Set<String> visited, 
-                                  Set<String> recursionStack, Set<String> cycles) {
-        visited.add(nodeId);
-        recursionStack.add(nodeId);
-        
-        for (String successor : getSuccessors(nodeId)) {
-            if (!visited.contains(successor)) {
-                detectCyclesDFS(successor, visited, recursionStack, cycles);
-            } else if (recursionStack.contains(successor)) {
-                cycles.add(nodeId);
-                cycles.add(successor);
-            }
-        }
-        
-        recursionStack.remove(nodeId);
-    }
-    
-    /**
-     * Export graph to JSON (for debugging)
-     */
-    public ObjectNode exportToJson() {
-        ObjectNode root = mapper.createObjectNode();
-        ObjectNode nodes = root.putObject("nodes");
-        ObjectNode edges = root.putObject("edges");
-        
-        // Export nodes
+    public List<GraphNode> findMethodsByLineRange(String className, int lineNumber) {
+        List<GraphNode> result = new ArrayList<>();
         for (GraphNode node : nodeMap.values()) {
-            ObjectNode nodeJson = nodes.putObject(node.id);
-            nodeJson.put("type", node.type.toString());
-            nodeJson.putPOJO("properties", node.properties);
+            if (node.type == NodeType.METHOD) {
+                String nodeClassName = node.get("className");
+                Integer lineStart = node.get("lineStart");
+                Integer lineEnd = node.get("lineEnd");
+                
+                if (className.equals(nodeClassName) && lineStart != null && lineEnd != null) {
+                    if (lineNumber >= lineStart && lineNumber <= lineEnd) {
+                        result.add(node);
+                    }
+                }
+            }
         }
-        
-        // Export edges
-        int edgeIndex = 0;
-        for (GraphEdge edge : getAllEdges()) {
-            ObjectNode edgeJson = edges.putObject("edge_" + edgeIndex++);
-            edgeJson.put("from", edge.getFrom());
-            edgeJson.put("to", edge.getTo());
-            edgeJson.put("type", edge.getType());
-            edgeJson.putPOJO("properties", edge.getProperties());
-        }
-        
-        return root;
+        return result;
     }
     
     /**
-     * Load graph from dependency_graph.json
+     * Load graph from JSON file
      */
     public void loadFromFile(String graphJsonPath) throws Exception {
         System.out.println("\n📦 Loading graph from: " + graphJsonPath);
@@ -460,10 +373,8 @@ public class InMemoryGraphStorage {
         JsonNode methods = nodes.get("methods");
         if (methods != null && methods.isArray()) {
             int loaded = 0;
-            int skipped = 0;
             for (JsonNode method : methods) {
                 if (method.has("isExternal") && method.get("isExternal").asBoolean()) {
-                    skipped++;
                     continue;
                 }
                 
@@ -518,7 +429,7 @@ public class InMemoryGraphStorage {
                 addNode(method.get("id").asText(), NodeType.METHOD, props);
                 loaded++;
             }
-            System.out.println("  ✓ Loaded " + loaded + " methods (" + skipped + " external skipped)");
+            System.out.println("  ✓ Loaded " + loaded + " methods");
         }
         
         // Load Edges
@@ -551,7 +462,7 @@ public class InMemoryGraphStorage {
     }
     
     /**
-     * Print graph statistics
+     * Print statistics
      */
     public void printStats() {
         System.out.println("\n📊 Graph Statistics:");
@@ -566,7 +477,7 @@ public class InMemoryGraphStorage {
         System.out.println("    Methods: " + methodCount);
         System.out.println("    Packages: " + packageCount);
         
-        // Find methods with external calls
+        // Methods with external calls
         long methodsWithExternal = nodeMap.values().stream()
             .filter(n -> n.type == NodeType.METHOD)
             .filter(n -> {
@@ -577,17 +488,24 @@ public class InMemoryGraphStorage {
         
         System.out.println("  Methods with external calls: " + methodsWithExternal);
         
-        // Find cycles
-        Set<String> cycles = detectCycles();
-        if (!cycles.isEmpty()) {
-            System.out.println("  ⚠️  Cycles detected: " + cycles.size() + " nodes involved");
-        } else {
-            System.out.println("  ✅ No cycles detected");
-        }
+        // Top 10 most called methods
+        Map<String, Integer> callCounts = getMethodCallCounts();
+        System.out.println("\n  Top 10 most called methods:");
+        callCounts.entrySet().stream()
+            .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+            .limit(10)
+            .forEach(entry -> {
+                String methodId = entry.getKey();
+                int count = entry.getValue();
+                // Truncate long method names for display
+                String shortName = methodId.length() > 80 ? 
+                    methodId.substring(0, 77) + "..." : methodId;
+                System.out.println("    " + shortName + " (" + count + " calls)");
+            });
     }
     
     /**
-     * Generate test recommendations for uncovered methods
+     * Generate test recommendations
      */
     public String generateTestRecommendations(String methodId) {
         GraphNode method = getNode(methodId);
@@ -598,17 +516,18 @@ public class InMemoryGraphStorage {
         StringBuilder sb = new StringBuilder();
         sb.append("Test Recommendations for: ").append(methodId).append("\n\n");
         
-        // Get conditions
         List<String> conditions = method.get("conditions");
         if (conditions != null && !conditions.isEmpty()) {
             sb.append("Paths to test:\n");
-            for (int i = 0; i < conditions.size(); i++) {
+            for (int i = 0; i < Math.min(conditions.size(), 10); i++) {
                 sb.append("  Path ").append(i + 1).append(": ").append(conditions.get(i)).append("\n");
+            }
+            if (conditions.size() > 10) {
+                sb.append("  ... and ").append(conditions.size() - 10).append(" more\n");
             }
             sb.append("\n");
         }
         
-        // Get null checks
         List<String> nullChecks = method.get("nullChecks");
         if (nullChecks != null && !nullChecks.isEmpty()) {
             sb.append("Null safety tests:\n");
@@ -618,7 +537,6 @@ public class InMemoryGraphStorage {
             sb.append("\n");
         }
         
-        // Get external calls (need mocking)
         List<String> externalCalls = method.get("externalCalls");
         if (externalCalls != null && !externalCalls.isEmpty()) {
             sb.append("Mocks needed:\n");
@@ -628,32 +546,20 @@ public class InMemoryGraphStorage {
             sb.append("\n");
         }
         
-        // Get sibling calls (may need spying)
-        List<String> siblingCalls = method.get("siblingCalls");
-        if (siblingCalls != null && !siblingCalls.isEmpty()) {
-            sb.append("Internal dependencies (consider spying):\n");
-            for (String call : siblingCalls) {
-                sb.append("  - ").append(call).append("\n");
-            }
-            sb.append("\n");
-        }
-        
-        // Get callers (impact analysis)
         List<String> callers = getCallers(methodId);
         if (!callers.isEmpty()) {
-            sb.append("This method is called by:\n");
-            for (String caller : callers) {
-                sb.append("  - ").append(caller).append("\n");
+            sb.append("This method is called by ").append(callers.size()).append(" methods:\n");
+            for (int i = 0; i < Math.min(callers.size(), 5); i++) {
+                sb.append("  - ").append(callers.get(i)).append("\n");
             }
-            sb.append("\n");
+            if (callers.size() > 5) {
+                sb.append("  ... and ").append(callers.size() - 5).append(" more\n");
+            }
         }
         
         return sb.toString();
     }
     
-    /**
-     * Main method - Load graph from file
-     */
     public static void main(String[] args) {
         String graphJsonPath = args.length > 0 ? args[0] : 
             "C:/Users/PrabalBhardwaj/Desktop/osttra-harmony3/dependency_graph.json";
@@ -665,47 +571,24 @@ public class InMemoryGraphStorage {
         InMemoryGraphStorage storage = new InMemoryGraphStorage();
         
         try {
+            long startTime = System.currentTimeMillis();
+            
             // Load graph from file
             storage.loadFromFile(graphJsonPath);
             
             // Print statistics
             storage.printStats();
             
-            // Example queries
-            System.out.println("\n🔍 Example Queries:");
-            
-            // Find methods with external calls
-            List<GraphNode> methodsWithExternal = storage.findMethodsWithExternalCalls();
-            if (!methodsWithExternal.isEmpty()) {
-                System.out.println("\n  Methods with external calls:");
-                methodsWithExternal.stream().limit(5).forEach(m -> {
-                    List<String> calls = m.get("externalCalls");
-                    System.out.println("    " + m.id + " → " + calls.size() + " external calls");
-                });
-            }
-            
-            // Get most called methods
-            Map<String, Integer> callCounts = storage.getMethodCallCounts();
-            if (!callCounts.isEmpty()) {
-                System.out.println("\n  Most called methods:");
-                callCounts.entrySet().stream()
-                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                    .limit(5)
-                    .forEach(entry -> System.out.println("    " + entry.getKey() + " (" + entry.getValue() + " calls)"));
-            }
-            
-            // Check for cycles
+            // Detect cycles (iterative - safe for large graphs)
             Set<String> cycles = storage.detectCycles();
             if (!cycles.isEmpty()) {
-                System.out.println("\n  ⚠️  Cycles detected in call graph!");
+                System.out.println("\n⚠️  Cycles detected: " + cycles.size() + " nodes involved");
+                System.out.println("  Sample cycle nodes:");
                 cycles.stream().limit(10).forEach(n -> System.out.println("    " + n));
             }
             
-            // Generate test recommendations for a sample method
-            if (!methodsWithExternal.isEmpty()) {
-                System.out.println("\n📝 Test Recommendations for: " + methodsWithExternal.get(0).id);
-                System.out.println(storage.generateTestRecommendations(methodsWithExternal.get(0).id));
-            }
+            long elapsed = System.currentTimeMillis() - startTime;
+            System.out.println("\n⏱️  Total time: " + (elapsed / 1000.0) + " seconds");
             
         } catch (Exception e) {
             System.err.println("❌ Error: " + e.getMessage());

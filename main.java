@@ -1,14 +1,3 @@
-Looking at the test failures in the PDF, there are several categories of errors that need to be fixed in the MaSaveOpTest.java file:
-
-1. Unfinished stubbing - Mockito stubs missing .thenReturn() or .thenThrow()
-2. ClassNotPreparedException - Classes not added to @PrepareForTest annotation
-3. Invalid use of argument matchers - Using matchers outside of stubbing/verification
-4. Type mismatch in Whitebox.setInternalState - Setting Connection field with Object
-5. NullPointerException in various test methods
-
-Here's the complete fixed file:
-
-```java
 package com.traiana.bundle.setup.dma.ma;
 
 import org.powermock.reflect.Whitebox;
@@ -276,4 +265,13 @@ public class MaSaveOpTest {
             Mockito.when(expandChanges.getCurrenciesAdded_ExcticNDO()).thenReturn(new java.util.ArrayList<com.traiana.bundle.fxweb.dna.screen.ExpandChanges.BoolValue>());
             Mockito.when(expandChanges.getCurrenciesAdded_Bullion()).thenReturn(new java.util.ArrayList<com.traiana.bundle.fxweb.dna.screen.ExpandChanges.BoolValue>());
             Mockito.when(expandChanges.getCurrenciesAdded_Bullion_ccyPairs()).thenReturn(new java.util.ArrayList<com.traiana.bundle.fxweb.dna.screen.ExpandChanges.BoolValue>());
-            Mockito.when(expandChanges.getMastSelectedCurrencyTypeMap()).thenReturn(new java.util.HashMap<java.lang.
+            Mockito.when(expandChanges.getMastSelectedCurrencyTypeMap()).thenReturn(new java.util.HashMap<java.lang.Object, java.lang.Object>());
+            org.powermock.reflect.Whitebox.invokeMethod(maSaveOp, "expandValidation");
+            Mockito.verify(expandChanges, Mockito.times(1)).getProductAdded();
+            Mockito.verify(expandChanges, Mockito.times(1)).getTenorsAdded();
+        }
+
+        @Test
+        public void test_expandValidation_productsAndTenorsAdded() throws Exception {
+            com.traiana.bundle.setup.dma.ma.MaSaveOp maSaveOp = org.powermock.reflect.Whitebox.newInstance(com.traiana.bundle.setup.dma.ma.MaSaveOp.class);
+          
